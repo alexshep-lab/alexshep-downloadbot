@@ -126,7 +126,9 @@ def url_key(url: str) -> str:
         if len(path) >= 2 and path[0] in ("shorts", "live", "embed"):
             return f"yt:{path[1]}"
     if "instagram" in host and len(path) >= 2:
-        return f"ig:{path[0]}:{path[1]}"
+        # весь путь целиком: у историй он вида /stories/автор/id, и по первым двум
+        # сегментам разные истории одного автора слились бы в один ключ
+        return "ig:" + ":".join(path)
     if host.endswith("tiktok.com") and path:
         # /@user/video/123456 — длинная ссылка; vm./vt./t/КОД — короткая, ключуем по коду
         if "video" in path and len(path) > path.index("video") + 1:
@@ -137,7 +139,10 @@ def url_key(url: str) -> str:
         status_at = path.index("status")
         if len(path) > status_at + 1:
             return f"x:{path[status_at + 1]}"
-    return f"{host}{parts.path}".rstrip("/")
+    # ссылка незнакомого вида: берём и путь, и параметры. Без параметров, например,
+    # два разных плейлиста YouTube дали бы один ключ и кеш вернул бы чужое видео
+    tail = f"?{parts.query}" if parts.query else ""
+    return f"{host}{parts.path}".rstrip("/") + tail
 
 WELCOME = (
     "Привет! Пришли мне ссылку на видео из YouTube (в т.ч. Shorts), "
@@ -160,18 +165,24 @@ def is_allowed(message: Message) -> bool:
     return message.chat.id in ALLOWED_CHAT_IDS
 
 
+def one_line(text: str | None, limit: int = 64) -> str:
+    """Имена и названия чатов задаёт посторонний: переносы строк из них
+    позволили бы дописывать в лог поддельные строки."""
+    return " ".join((text or "").split())[:limit]
+
+
 def describe_sender(message: Message) -> str:
     """Кто и откуда попросил — для логов."""
     user = message.from_user
     if not user:
         who = "неизвестный"
     elif user.username:
-        who = f"@{user.username} (id={user.id})"
+        who = f"@{one_line(user.username)} (id={user.id})"
     else:
-        who = f"{user.full_name} (id={user.id})"
+        who = f"{one_line(user.full_name)} (id={user.id})"
     if message.chat.type == ChatType.PRIVATE:
         return f"{who} в личке"
-    return f"{who} в группе «{message.chat.title}» ({message.chat.id})"
+    return f"{who} в группе «{one_line(message.chat.title)}» ({message.chat.id})"
 
 
 def is_supported(url: str) -> bool:
@@ -433,11 +444,18 @@ def friendly_dlp_error(exc: yt_dlp.utils.DownloadError, service: str = "") -> st
 @router.message(CommandStart())
 @router.message(Command("help"))
 async def cmd_start(message: Message) -> None:
+    if not is_allowed(message):
+        if message.chat.type == ChatType.PRIVATE:
+            await message.reply("⛔ Это личный бот, доступ только по списку.")
+        return
     await message.answer(WELCOME)
 
 
 @router.message(Command("id"))
 async def cmd_id(message: Message) -> None:
+    # владельцу отвечаем в любом чате (его id в списке), посторонним — молчим
+    if not is_allowed(message):
+        return
     await message.reply(
         f"id этого чата: <code>{message.chat.id}</code>\n"
         f"твой user id: <code>{message.from_user.id if message.from_user else '—'}</code>"
