@@ -84,6 +84,7 @@ Instagram часто отдаёт видео только залогиненны
 | `ALLOWED_USER_IDS` | кто может пользоваться ботом, id через запятую; пусто = все |
 | `ALLOWED_CHAT_IDS` | разрешённые группы (id отрицательный, узнать — /id в чате) |
 | `COOKIES_FILE` | путь к cookies.txt для Instagram/YouTube |
+| `COOKIES_SERVICES` | кому подставлять cookies: `ig,yt,tt,x` или `all` (по умолчанию `ig`) |
 | `PROXY` | прокси для скачивания (`http://...`, `socks5://...`) |
 | `ALLOW_ANY_SITE` | `true` = качать с любых сайтов, которые знает yt-dlp |
 | `DOWNLOAD_DIR` | папка для временных файлов |

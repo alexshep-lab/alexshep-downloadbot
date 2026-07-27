@@ -37,6 +37,12 @@ ALLOWED_CHAT_IDS = {
     int(part) for part in os.getenv("ALLOWED_CHAT_IDS", "").replace(" ", "").split(",") if part
 }
 COOKIES_FILE = os.getenv("COOKIES_FILE", "").strip()
+# Для каких сервисов подставлять cookies: ig/yt/tt/x через запятую либо all.
+# По умолчанию только Instagram: yt-dlp дописывает в файл cookies всех посещённых
+# сайтов, и YouTube на своих же протухших cookies начинает отвечать 403.
+COOKIES_SERVICES = {
+    s for s in os.getenv("COOKIES_SERVICES", "ig").replace(" ", "").lower().split(",") if s
+}
 PROXY = os.getenv("PROXY", "").strip()
 ALLOW_ANY_SITE = os.getenv("ALLOW_ANY_SITE", "").strip().lower() in {"1", "true", "yes"}
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR") or Path(tempfile.gettempdir()) / "alexshep_download_bot")
@@ -190,7 +196,11 @@ def is_supported(url: str) -> bool:
     return any(host == h or host.endswith("." + h) for h in SUPPORTED_HOSTS)
 
 
-def _base_opts() -> dict:
+def use_cookies_for(service: str) -> bool:
+    return bool(COOKIES_FILE) and ("all" in COOKIES_SERVICES or service in COOKIES_SERVICES)
+
+
+def _base_opts(service: str = "") -> dict:
     opts = {
         "noplaylist": True,
         "playlist_items": "1",
@@ -201,14 +211,14 @@ def _base_opts() -> dict:
         # при 429 каждый повтор только продлевает блокировку, поэтому их поменьше
         "extractor_retries": 1,
     }
-    if COOKIES_FILE:
+    if use_cookies_for(service):
         opts["cookiefile"] = COOKIES_FILE
     if PROXY:
         opts["proxy"] = PROXY
     return opts
 
 
-def _ydl_opts(workdir: Path, height: int, on_progress=None) -> dict:
+def _ydl_opts(workdir: Path, height: int, on_progress=None, service: str = "") -> dict:
     # H.264 в приоритете: YouTube отдаёт AV1 примерно в 10 раз медленнее,
     # да и играется H.264 на любом клиенте Telegram
     fmt = (
@@ -219,7 +229,7 @@ def _ydl_opts(workdir: Path, height: int, on_progress=None) -> dict:
         f"b[height<={height}]/b"
     )
     hooks = {"progress_hooks": [on_progress]} if on_progress else {}
-    return _base_opts() | hooks | {
+    return _base_opts(service) | hooks | {
         "format": fmt,
         "outtmpl": str(workdir / "%(id)s.%(ext)s"),
         "merge_output_format": "mp4",
@@ -362,7 +372,8 @@ class ProgressReporter:
 
 def download_video(url: str, workdir: Path, on_progress=None) -> tuple[Path, dict]:
     """Скачивает видео, подбирая качество так, чтобы файл влез в лимит Telegram."""
-    with yt_dlp.YoutubeDL(_base_opts()) as ydl:
+    service = service_of(url_key(url))
+    with yt_dlp.YoutubeDL(_base_opts(service)) as ydl:
         probe = _pick_entry(ydl.extract_info(url, download=False))
     start_height = choose_start_height(probe)
     ladder = tuple(h for h in HEIGHT_LADDER if h <= start_height) or (HEIGHT_LADDER[-1],)
@@ -370,7 +381,7 @@ def download_video(url: str, workdir: Path, on_progress=None) -> tuple[Path, dic
         attempt_dir = workdir / f"h{height}"
         attempt_dir.mkdir(parents=True, exist_ok=True)
         try:
-            with yt_dlp.YoutubeDL(_ydl_opts(attempt_dir, height, on_progress)) as ydl:
+            with yt_dlp.YoutubeDL(_ydl_opts(attempt_dir, height, on_progress, service)) as ydl:
                 info = _pick_entry(ydl.extract_info(url, download=True))
         except yt_dlp.utils.DownloadError as exc:
             if "max-filesize" in str(exc).lower():
