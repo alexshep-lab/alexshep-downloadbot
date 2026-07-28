@@ -132,12 +132,6 @@ def progress_kb(job: Job) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[buttons])
 
 
-def delete_kb(requester_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🗑 Удалить", callback_data=f"d:{requester_id}")
-    ]])
-
-
 def cache_key(key: str, kind: str) -> str:
     return key if kind == "video" else f"{key}#{kind}"
 
@@ -643,17 +637,13 @@ async def send_cached(message: Message, status: Message, key: str, kind: str) ->
     entry = cache_get(key, kind)
     if not entry:
         return False
-    requester_id = message.from_user.id if message.from_user else 0
     caption = entry.get("title") or None
     try:
         if kind == "audio":
-            await message.reply_audio(
-                entry["file_id"], caption=caption, reply_markup=delete_kb(requester_id)
-            )
+            await message.reply_audio(entry["file_id"], caption=caption)
         else:
             await message.reply_video(
-                entry["file_id"], caption=caption, supports_streaming=True,
-                reply_markup=delete_kb(requester_id),
+                entry["file_id"], caption=caption, supports_streaming=True
             )
         await status.delete()
         return True
@@ -718,7 +708,6 @@ async def download_and_send(
                 title=(info.get("track") or info.get("title") or "")[:64] or None,
                 performer=(info.get("artist") or info.get("uploader") or "")[:64] or None,
                 duration=int(info.get("duration") or 0) or None,
-                reply_markup=delete_kb(requester_id),
             )
         else:
             send = message.reply_video(
@@ -728,7 +717,6 @@ async def download_and_send(
                 width=info.get("width"),
                 height=info.get("height"),
                 supports_streaming=True,
-                reply_markup=delete_kb(requester_id),
             )
         sent = await message.bot(send, request_timeout=UPLOAD_TIMEOUT)
         media = sent.audio if kind == "audio" else sent.video
@@ -814,24 +802,6 @@ async def cb_audio(query: CallbackQuery) -> None:
     job.cancelled = True
     job.kind = "audio"  # download_and_send перезапустит закачку в аудиорежиме
     await query.answer("Переключаюсь на звук…")
-
-
-@router.callback_query(F.data.startswith("d:"))
-async def cb_delete(query: CallbackQuery) -> None:
-    requester_id = int(query.data.split(":", 1)[1])
-    if not may_manage(query.from_user.id, requester_id):
-        await query.answer("Удалить может тот, кто прислал ссылку, или владелец бота.",
-                           show_alert=True)
-        return
-    try:
-        await query.message.delete()
-        await query.answer("Удалено.")
-    except Exception as exc:
-        log.warning("не смог удалить сообщение: %s", exc)
-        await query.answer(
-            "Не получилось удалить — Telegram разрешает боту удалять свои сообщения "
-            "только первые 48 часов.", show_alert=True,
-        )
 
 
 async def main() -> None:
