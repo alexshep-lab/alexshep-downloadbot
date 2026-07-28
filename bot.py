@@ -5,6 +5,7 @@
 
 import asyncio
 import html
+import itertools
 import json
 import logging
 import os
@@ -24,7 +25,13 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 from aiogram.enums import ChatAction, ChatType, ParseMode
 from aiogram.filters import Command, CommandStart
-from aiogram.types import FSInputFile, Message
+from aiogram.types import (
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -85,8 +92,66 @@ download_slots = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
 # одно и то же видео качаем один раз: второй чат ждёт на замке и получает готовый file_id
 CACHE_FILE = Path(os.getenv("CACHE_FILE") or "file_ids.json")
-file_ids: dict[str, str] = {}
+file_ids: dict[str, dict] = {}  # ключ → {"file_id": …, "title": …}
 url_locks: dict[str, asyncio.Lock] = {}
+jobs: dict[str, "Job"] = {}  # идущие закачки, чтобы их можно было отменить кнопкой
+job_counter = itertools.count(1)
+
+
+class CancelledByUser(Exception):
+    """Пользователь нажал «Отменить»."""
+
+
+class Job:
+    """Идущая закачка: нужна, чтобы кнопка могла её остановить."""
+
+    def __init__(self, requester_id: int, kind: str) -> None:
+        self.id = str(next(job_counter))
+        self.requester_id = requester_id
+        self.kind = kind  # video | audio
+        self.cancelled = False
+        jobs[self.id] = self
+
+    def check(self) -> None:
+        if self.cancelled:
+            raise CancelledByUser
+
+    def close(self) -> None:
+        jobs.pop(self.id, None)
+
+
+def may_manage(user_id: int, requester_id: int) -> bool:
+    """Управлять закачкой может тот, кто её заказал, и владелец бота."""
+    return user_id == requester_id or user_id in ALLOWED_USER_IDS
+
+
+def progress_kb(job: Job) -> InlineKeyboardMarkup:
+    buttons = [InlineKeyboardButton(text="❌ Отменить", callback_data=f"c:{job.id}")]
+    if job.kind == "video":
+        buttons.insert(0, InlineKeyboardButton(text="🎵 Только звук", callback_data=f"a:{job.id}"))
+    return InlineKeyboardMarkup(inline_keyboard=[buttons])
+
+
+def delete_kb(requester_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🗑 Удалить", callback_data=f"d:{requester_id}")
+    ]])
+
+
+def cache_key(key: str, kind: str) -> str:
+    return key if kind == "video" else f"{key}#{kind}"
+
+
+def cache_get(key: str, kind: str) -> dict | None:
+    entry = file_ids.get(cache_key(key, kind))
+    if isinstance(entry, str):  # записи, сделанные до появления названий
+        return {"file_id": entry, "title": ""}
+    return entry
+
+
+def cache_put(key: str, kind: str, file_id: str, title: str) -> None:
+    file_ids[cache_key(key, kind)] = {"file_id": file_id, "title": title}
+    save_cache()
 rate_limited_until: dict[str, float] = {}  # "ig"/"yt" → до какого времени не трогать
 
 SERVICE_NAMES = {"ig": "Instagram", "yt": "YouTube", "x": "X", "tt": "TikTok"}
@@ -218,6 +283,23 @@ def _base_opts(service: str = "") -> dict:
     return opts
 
 
+def _audio_opts(workdir: Path, on_progress=None, service: str = "") -> dict:
+    hooks = {"progress_hooks": [on_progress]} if on_progress else {}
+    return _base_opts(service) | hooks | {
+        "format": "bestaudio/best",
+        "outtmpl": str(workdir / "%(id)s.%(ext)s"),
+        "max_filesize": SIZE_TARGET,
+        "restrictfilenames": True,
+        "noprogress": True,
+        "writethumbnail": True,
+        "postprocessors": [
+            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"},
+            {"key": "FFmpegMetadata"},  # исполнитель и название прямо в файл
+            {"key": "EmbedThumbnail"},  # обложкой станет превью ролика
+        ],
+    }
+
+
 def _ydl_opts(workdir: Path, height: int, on_progress=None, service: str = "") -> dict:
     # H.264 в приоритете: YouTube отдаёт AV1 примерно в 10 раз медленнее,
     # да и играется H.264 на любом клиенте Telegram
@@ -324,13 +406,18 @@ class ProgressReporter:
     отправляем в event loop через run_coroutine_threadsafe.
     """
 
-    def __init__(self, loop: asyncio.AbstractEventLoop, status: Message) -> None:
+    def __init__(
+        self, loop: asyncio.AbstractEventLoop, status: Message, job: "Job | None" = None
+    ) -> None:
         self._loop = loop
         self._status = status
+        self._job = job
         self._last_at = 0.0
         self._last_text = ""
 
     def hook(self, data: dict) -> None:
+        if self._job:
+            self._job.check()  # нажали «Отменить» — прерываем скачивание
         status = data.get("status")
         if status == "finished":
             self._show("⏳ Обрабатываю видео…")
@@ -365,9 +452,27 @@ class ProgressReporter:
 
     async def _edit(self, text: str) -> None:
         try:
-            await self._status.edit_text(text)
+            # клавиатуру передаём каждый раз: правка без неё убрала бы кнопки
+            markup = progress_kb(self._job) if self._job and not self._job.cancelled else None
+            await self._status.edit_text(text, reply_markup=markup)
         except Exception as exc:  # статус не должен ломать скачивание
             log.debug("не смог обновить статус: %s", exc)
+
+
+def download_audio(url: str, workdir: Path, on_progress=None) -> tuple[Path, dict]:
+    """Забирает только звуковую дорожку и кладёт её в mp3 с тегами и обложкой."""
+    workdir.mkdir(parents=True, exist_ok=True)
+    service = service_of(url_key(url))
+    with yt_dlp.YoutubeDL(_audio_opts(workdir, on_progress, service)) as ydl:
+        info = _pick_entry(ydl.extract_info(url, download=True))
+    audio = next((f for f in workdir.glob("*.mp3")), None)
+    if audio is None:  # постпроцессор не отработал — отдаём что скачалось
+        audio = _result_file(info)
+    if audio is None or not audio.exists():
+        raise yt_dlp.utils.DownloadError("не удалось выделить звуковую дорожку")
+    if audio.stat().st_size > MAX_FILE_SIZE:
+        raise TooLargeError
+    return audio, info
 
 
 def download_video(url: str, workdir: Path, on_progress=None) -> tuple[Path, dict]:
@@ -511,50 +616,75 @@ async def handle_link(message: Message) -> None:
         log.info("[%s] уже качается, %s ждёт результат", key, who)
         await status.edit_text("⏳ Это видео уже качается — дождусь и пришлю сюда тоже.")
     async with lock:
-        if await send_cached(message, status, key):
-            log.info("[%s] отправлено из кеша для %s", key, who)
-            return
-        service = service_of(key)
-        left = cooldown_left(service)
-        if left:
-            log.info("[%s] в паузе после 429, осталось %s", key, fmt_time(left))
-            await status.edit_text(
-                f"🚦 {SERVICE_NAMES.get(service, 'Сервис')} ограничил нас по частоте запросов. "
-                f"Подожди ещё {fmt_time(left)} и пришли ссылку заново."
-            )
-            return
-        await download_and_send(message, status, url, key, who)
+        await deliver(message, status, url, key, who, "video")
 
 
-async def send_cached(message: Message, status: Message, key: str) -> bool:
-    """Уже отправляли это видео — Telegram перешлёт его по file_id мгновенно."""
-    file_id = file_ids.get(key)
-    if not file_id:
+async def deliver(
+    message: Message, status: Message, url: str, key: str, who: str, kind: str
+) -> None:
+    """Отдаёт видео или звук: из кеша, если уже качали, иначе скачивает."""
+    if await send_cached(message, status, key, kind):
+        log.info("[%s/%s] отправлено из кеша для %s", key, kind, who)
+        return
+    service = service_of(key)
+    left = cooldown_left(service)
+    if left:
+        log.info("[%s] в паузе после 429, осталось %s", key, fmt_time(left))
+        await status.edit_text(
+            f"🚦 {SERVICE_NAMES.get(service, 'Сервис')} ограничил нас по частоте запросов. "
+            f"Подожди ещё {fmt_time(left)} и пришли ссылку заново."
+        )
+        return
+    await download_and_send(message, status, url, key, who, kind)
+
+
+async def send_cached(message: Message, status: Message, key: str, kind: str) -> bool:
+    """Уже отправляли — Telegram перешлёт файл по file_id мгновенно."""
+    entry = cache_get(key, kind)
+    if not entry:
         return False
+    requester_id = message.from_user.id if message.from_user else 0
+    caption = entry.get("title") or None
     try:
-        await message.reply_video(file_id, supports_streaming=True)
+        if kind == "audio":
+            await message.reply_audio(
+                entry["file_id"], caption=caption, reply_markup=delete_kb(requester_id)
+            )
+        else:
+            await message.reply_video(
+                entry["file_id"], caption=caption, supports_streaming=True,
+                reply_markup=delete_kb(requester_id),
+            )
         await status.delete()
         return True
     except Exception as exc:
         log.warning("не смог отправить из кеша (%s), качаю заново: %s", key, exc)
-        file_ids.pop(key, None)
+        file_ids.pop(cache_key(key, kind), None)
         save_cache()
         return False
 
 
 async def download_and_send(
-    message: Message, status: Message, url: str, key: str, who: str
+    message: Message, status: Message, url: str, key: str, who: str, kind: str
 ) -> None:
-    reporter = ProgressReporter(asyncio.get_running_loop(), status)
+    requester_id = message.from_user.id if message.from_user else 0
+    job = Job(requester_id, kind)
+    reporter = ProgressReporter(asyncio.get_running_loop(), status, job)
+    grab = download_audio if kind == "audio" else download_video
     workdir = DOWNLOAD_DIR / uuid.uuid4().hex
     started = time.monotonic()
     try:
+        await status.edit_text(
+            "🔍 Смотрю, что за видео…" if kind == "video" else "🎵 Достаю звуковую дорожку…",
+            reply_markup=progress_kb(job),
+        )
         # временные ошибки (403 и т.п.) пересиливаем сами: пауза и новая попытка
         for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
             try:
                 async with download_slots:
+                    job.check()
                     path, info = await asyncio.wait_for(
-                        asyncio.to_thread(download_video, url, workdir, reporter.hook),
+                        asyncio.to_thread(grab, url, workdir, reporter.hook),
                         timeout=DOWNLOAD_TIMEOUT,
                     )
                 break
@@ -571,37 +701,65 @@ async def download_and_send(
                     f"(попытка {attempt + 1} из {DOWNLOAD_ATTEMPTS})"
                 )
                 await asyncio.sleep(delay)
-        await status.edit_text(f"📤 Отправляю в Telegram… ({fmt_size(path.stat().st_size)})")
-        await message.bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_VIDEO)
-        # шорткат reply_video только собирает метод SendVideo; отправляем его сами,
-        # чтобы задать request_timeout — иначе аплоад больших файлов рвётся на 60 c
-        send_video = message.reply_video(
-            FSInputFile(path),
-            caption=html.escape((info.get("title") or "Видео")[:900]),
-            duration=int(info.get("duration") or 0) or None,
-            width=info.get("width"),
-            height=info.get("height"),
-            supports_streaming=True,
+        job.check()
+        size = path.stat().st_size
+        title = (info.get("title") or ("Аудио" if kind == "audio" else "Видео"))[:900]
+        await status.edit_text(f"📤 Отправляю в Telegram… ({fmt_size(size)})")
+        await message.bot.send_chat_action(
+            message.chat.id,
+            ChatAction.UPLOAD_VOICE if kind == "audio" else ChatAction.UPLOAD_VIDEO,
         )
-        sent = await message.bot(send_video, request_timeout=UPLOAD_TIMEOUT)
-        if sent.video:  # запомним, чтобы второй раз не качать
-            file_ids[key] = sent.video.file_id
-            save_cache()
+        # шорткаты reply_* только собирают метод; отправляем его сами, чтобы задать
+        # request_timeout — иначе аплоад больших файлов рвётся на 60 c
+        if kind == "audio":
+            send = message.reply_audio(
+                FSInputFile(path),
+                caption=html.escape(title),
+                title=(info.get("track") or info.get("title") or "")[:64] or None,
+                performer=(info.get("artist") or info.get("uploader") or "")[:64] or None,
+                duration=int(info.get("duration") or 0) or None,
+                reply_markup=delete_kb(requester_id),
+            )
+        else:
+            send = message.reply_video(
+                FSInputFile(path),
+                caption=html.escape(title),
+                duration=int(info.get("duration") or 0) or None,
+                width=info.get("width"),
+                height=info.get("height"),
+                supports_streaming=True,
+                reply_markup=delete_kb(requester_id),
+            )
+        sent = await message.bot(send, request_timeout=UPLOAD_TIMEOUT)
+        media = sent.audio if kind == "audio" else sent.video
+        if media:  # запомним, чтобы второй раз не качать
+            cache_put(key, kind, media.file_id, title)
         log.info(
-            "[%s] готово за %s: %s, %sp, для %s",
-            key, fmt_time(time.monotonic() - started), fmt_size(path.stat().st_size),
-            info.get("height") or "?", who,
+            "[%s/%s] готово за %s: %s, %s, для %s",
+            key, kind, fmt_time(time.monotonic() - started), fmt_size(size),
+            f"{info.get('height')}p" if kind == "video" else "mp3", who,
         )
         await status.delete()
+    except CancelledByUser:
+        if kind == "video" and job.kind == "audio":  # нажали «Только звук»
+            log.info("[%s] переключаюсь на звук для %s", key, who)
+            job.close()
+            shutil.rmtree(workdir, ignore_errors=True)
+            await deliver(message, status, url, key, who, "audio")
+            return
+        log.info("[%s/%s] отменено пользователем", key, kind)
+        await status.edit_text("🚫 Закачка отменена.")
     except TooLargeError:
         hint = (
             "Больше — только ссылкой на файл: 2 ГБ это потолок самого Telegram."
             if MAX_FILE_SIZE_MB >= 2000
             else "Для файлов до 2 ГБ нужен локальный Bot API server — см. README."
         )
-        await status.edit_text(
-            f"😞 Видео не влезает в {MAX_FILE_SIZE_MB} МБ даже в {HEIGHT_LADDER[-1]}p.\n{hint}"
+        limit_note = (
+            f"😞 Звук не влезает в {MAX_FILE_SIZE_MB} МБ." if kind == "audio"
+            else f"😞 Видео не влезает в {MAX_FILE_SIZE_MB} МБ даже в {HEIGHT_LADDER[-1]}p."
         )
+        await status.edit_text(f"{limit_note}\n{hint}")
     except asyncio.TimeoutError:
         await status.edit_text("⌛ Скачивание не уложилось в таймаут. Попробуй ещё раз или видео покороче.")
     except yt_dlp.utils.DownloadError as exc:
@@ -626,7 +784,54 @@ async def download_and_send(
         log.exception("Не смог обработать %s", url)
         await status.edit_text("💥 Что-то пошло не так. Подробности в логах бота.")
     finally:
+        job.close()
         shutil.rmtree(workdir, ignore_errors=True)
+
+
+@router.callback_query(F.data.startswith("c:"))
+async def cb_cancel(query: CallbackQuery) -> None:
+    job = jobs.get(query.data.split(":", 1)[1])
+    if not job:
+        await query.answer("Эта закачка уже завершилась.", show_alert=True)
+        return
+    if not may_manage(query.from_user.id, job.requester_id):
+        await query.answer("Отменить может только тот, кто прислал ссылку.", show_alert=True)
+        return
+    job.cancelled = True
+    await query.answer("Отменяю…")
+
+
+@router.callback_query(F.data.startswith("a:"))
+async def cb_audio(query: CallbackQuery) -> None:
+    """«Только звук»: бросаем видео и качаем ту же ссылку аудиодорожкой."""
+    job = jobs.get(query.data.split(":", 1)[1])
+    if not job:
+        await query.answer("Эта закачка уже завершилась.", show_alert=True)
+        return
+    if not may_manage(query.from_user.id, job.requester_id):
+        await query.answer("Переключить может только тот, кто прислал ссылку.", show_alert=True)
+        return
+    job.cancelled = True
+    job.kind = "audio"  # download_and_send перезапустит закачку в аудиорежиме
+    await query.answer("Переключаюсь на звук…")
+
+
+@router.callback_query(F.data.startswith("d:"))
+async def cb_delete(query: CallbackQuery) -> None:
+    requester_id = int(query.data.split(":", 1)[1])
+    if not may_manage(query.from_user.id, requester_id):
+        await query.answer("Удалить может тот, кто прислал ссылку, или владелец бота.",
+                           show_alert=True)
+        return
+    try:
+        await query.message.delete()
+        await query.answer("Удалено.")
+    except Exception as exc:
+        log.warning("не смог удалить сообщение: %s", exc)
+        await query.answer(
+            "Не получилось удалить — Telegram разрешает боту удалять свои сообщения "
+            "только первые 48 часов.", show_alert=True,
+        )
 
 
 async def main() -> None:
