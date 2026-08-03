@@ -19,7 +19,7 @@ from urllib.parse import parse_qs, urlparse
 
 import yt_dlp
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.exceptions import TelegramNetworkError
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
@@ -71,6 +71,8 @@ PROGRESS_INTERVAL = float(os.getenv("PROGRESS_INTERVAL", "5"))
 THROTTLE_FLOOR_KB = int(os.getenv("THROTTLE_FLOOR_KB", "500"))
 # поймали 429 — на это время перестаём дёргать сервис, иначе блокировка только продлевается
 RATE_LIMIT_COOLDOWN_MIN = int(os.getenv("RATE_LIMIT_COOLDOWN_MIN", "30"))
+# в группах сообщения об ошибках самоудаляются через столько секунд (0 = висят всегда)
+ERROR_TTL_SEC = int(os.getenv("ERROR_TTL_SEC", "60"))
 
 DOWNLOAD_ATTEMPTS = 3  # сколько раз пробовать при временных ошибках (403 и т.п.)
 RETRY_DELAYS = (15, 45)  # паузы перед 2-й и 3-й попыткой, сек
@@ -539,6 +541,13 @@ def friendly_dlp_error(exc: yt_dlp.utils.DownloadError, service: str = "") -> st
             f"🚧 Сервер {DOWNLOAD_ATTEMPTS} раза подряд отклонил скачивание (HTTP 403) — "
             "похоже, наш IP временно придерживают. Подожди минут десять и пришли ссылку ещё раз."
         )
+    if "confirm your age" in low or "age-restricted" in low:
+        return (
+            "🔞 У этого видео возрастное ограничение — YouTube отдаёт его только "
+            "залогиненным, а cookies YouTube у бота нет. Скачать не получится."
+        )
+    if "404" in low and "not found" in low:
+        return "🗑 Похоже, пост удалён или ссылка битая (404)."
     if "sign in to confirm" in low or "not a bot" in low:
         return (
             "🤖 YouTube принял меня за бота (что справедливо) и требует вход в аккаунт.\n"
@@ -609,13 +618,35 @@ async def handle_link(message: Message) -> None:
     key = url_key(url)
     who = describe_sender(message)
     log.info("запрос: %s → %s [%s]", who, url, key)
-    status = await message.reply("🔍 Смотрю, что за видео…")
+    try:
+        status = await message.reply("🔍 Смотрю, что за видео…")
+    except (TelegramBadRequest, TelegramForbiddenError) as exc:
+        # бота ограничили в чате — молча пропускаем, иначе каждая ссылка сыпет трейсбеки
+        log.warning("не могу писать в чате %s (%s) — пропускаю ссылку", message.chat.id, exc.message)
+        return
     lock = url_locks.setdefault(key, asyncio.Lock())
     if lock.locked() and key not in file_ids:
         log.info("[%s] уже качается, %s ждёт результат", key, who)
         await status.edit_text("⏳ Это видео уже качается — дождусь и пришлю сюда тоже.")
     async with lock:
         await deliver(message, status, url, key, who, "video")
+
+
+async def show_error(status: Message, text: str) -> None:
+    """Показывает ошибку; в группах сообщение самоудаляется, чтобы не засорять чат."""
+    try:
+        await status.edit_text(text)
+    except Exception as exc:
+        log.debug("не смог показать ошибку: %s", exc)
+        return
+    if ERROR_TTL_SEC and status.chat.type != ChatType.PRIVATE:
+        async def _cleanup() -> None:
+            await asyncio.sleep(ERROR_TTL_SEC)
+            try:
+                await status.delete()
+            except Exception:
+                pass
+        asyncio.create_task(_cleanup())
 
 
 async def deliver(
@@ -629,9 +660,10 @@ async def deliver(
     left = cooldown_left(service)
     if left:
         log.info("[%s] в паузе после 429, осталось %s", key, fmt_time(left))
-        await status.edit_text(
+        await show_error(
+            status,
             f"🚦 {SERVICE_NAMES.get(service, 'Сервис')} ограничил нас по частоте запросов. "
-            f"Подожди ещё {fmt_time(left)} и пришли ссылку заново."
+            f"Подожди ещё {fmt_time(left)} и пришли ссылку заново.",
         )
         return
     await download_and_send(message, status, url, key, who, kind)
@@ -741,7 +773,7 @@ async def download_and_send(
             await deliver(message, status, url, key, who, "audio")
             return
         log.info("[%s/%s] отменено пользователем", key, kind)
-        await status.edit_text("🚫 Закачка отменена.")
+        await show_error(status, "🚫 Закачка отменена.")
     except TooLargeError:
         hint = (
             "Больше — только ссылкой на файл: 2 ГБ это потолок самого Telegram."
@@ -752,9 +784,9 @@ async def download_and_send(
             f"😞 Звук не влезает в {MAX_FILE_SIZE_MB} МБ." if kind == "audio"
             else f"😞 Видео не влезает в {MAX_FILE_SIZE_MB} МБ даже в {HEIGHT_LADDER[-1]}p."
         )
-        await status.edit_text(f"{limit_note}\n{hint}")
+        await show_error(status, f"{limit_note}\n{hint}")
     except asyncio.TimeoutError:
-        await status.edit_text("⌛ Скачивание не уложилось в таймаут. Попробуй ещё раз или видео покороче.")
+        await show_error(status, "⌛ Скачивание не уложилось в таймаут. Попробуй ещё раз или видео покороче.")
     except yt_dlp.utils.DownloadError as exc:
         service = service_of(key)
         if is_rate_limited(exc):
@@ -765,17 +797,18 @@ async def download_and_send(
             )
         else:
             log.warning("yt-dlp error for %s: %s", url, exc)
-        await status.edit_text(friendly_dlp_error(exc, service))
+        await show_error(status, friendly_dlp_error(exc, service))
     except TelegramNetworkError as exc:
         log.warning("upload failed for %s: %s", url, exc)
-        await status.edit_text(
+        await show_error(
+            status,
             "📶 Скачал, но не смог загрузить файл в Telegram — оборвалась сеть или "
             "не хватило таймаута на отправку. Попробуй ещё раз; если повторяется, "
-            "увеличь UPLOAD_TIMEOUT в .env."
+            "увеличь UPLOAD_TIMEOUT в .env.",
         )
     except Exception:
         log.exception("Не смог обработать %s", url)
-        await status.edit_text("💥 Что-то пошло не так. Подробности в логах бота.")
+        await show_error(status, "💥 Что-то пошло не так. Подробности в логах бота.")
     finally:
         job.close()
         shutil.rmtree(workdir, ignore_errors=True)
