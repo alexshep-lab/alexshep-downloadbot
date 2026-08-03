@@ -50,6 +50,12 @@ COOKIES_FILE = os.getenv("COOKIES_FILE", "").strip()
 COOKIES_SERVICES = {
     s for s in os.getenv("COOKIES_SERVICES", "ig").replace(" ", "").lower().split(",") if s
 }
+# Этим сервисам cookies подставляются только со второй попытки — когда первая,
+# анонимная, упёрлась в «нужен вход» (бот-проверка, возрастное ограничение).
+# Так аккаунт светится лишь там, где без него никак.
+COOKIES_FALLBACK_SERVICES = {
+    s for s in os.getenv("COOKIES_FALLBACK_SERVICES", "yt").replace(" ", "").lower().split(",") if s
+}
 PROXY = os.getenv("PROXY", "").strip()
 ALLOW_ANY_SITE = os.getenv("ALLOW_ANY_SITE", "").strip().lower() in {"1", "true", "yes"}
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR") or Path(tempfile.gettempdir()) / "alexshep_download_bot")
@@ -261,7 +267,26 @@ def use_cookies_for(service: str) -> bool:
     return bool(COOKIES_FILE) and ("all" in COOKIES_SERVICES or service in COOKIES_SERVICES)
 
 
-def _base_opts(service: str = "") -> dict:
+def has_cookie_fallback(service: str) -> bool:
+    return (
+        bool(COOKIES_FILE)
+        and service in COOKIES_FALLBACK_SERVICES
+        and not use_cookies_for(service)
+    )
+
+
+AUTH_ERROR_MARKERS = (
+    "sign in", "not a bot", "confirm your age", "age-restricted",
+    "login required", "members-only", "members only",
+)
+
+
+def is_auth_error(exc: yt_dlp.utils.DownloadError) -> bool:
+    low = ANSI_RE.sub("", str(exc)).lower()
+    return any(marker in low for marker in AUTH_ERROR_MARKERS)
+
+
+def _base_opts(service: str = "", with_cookies: bool = False) -> dict:
     opts = {
         "noplaylist": True,
         "playlist_items": "1",
@@ -272,16 +297,18 @@ def _base_opts(service: str = "") -> dict:
         # при 429 каждый повтор только продлевает блокировку, поэтому их поменьше
         "extractor_retries": 1,
     }
-    if use_cookies_for(service):
+    if with_cookies or use_cookies_for(service):
         opts["cookiefile"] = COOKIES_FILE
     if PROXY:
         opts["proxy"] = PROXY
     return opts
 
 
-def _audio_opts(workdir: Path, on_progress=None, service: str = "") -> dict:
+def _audio_opts(
+    workdir: Path, on_progress=None, service: str = "", with_cookies: bool = False
+) -> dict:
     hooks = {"progress_hooks": [on_progress]} if on_progress else {}
-    return _base_opts(service) | hooks | {
+    return _base_opts(service, with_cookies) | hooks | {
         "format": "bestaudio/best",
         "outtmpl": str(workdir / "%(id)s.%(ext)s"),
         "max_filesize": SIZE_TARGET,
@@ -296,7 +323,9 @@ def _audio_opts(workdir: Path, on_progress=None, service: str = "") -> dict:
     }
 
 
-def _ydl_opts(workdir: Path, height: int, on_progress=None, service: str = "") -> dict:
+def _ydl_opts(
+    workdir: Path, height: int, on_progress=None, service: str = "", with_cookies: bool = False
+) -> dict:
     # H.264 в приоритете: YouTube отдаёт AV1 примерно в 10 раз медленнее,
     # да и играется H.264 на любом клиенте Telegram
     fmt = (
@@ -307,7 +336,7 @@ def _ydl_opts(workdir: Path, height: int, on_progress=None, service: str = "") -
         f"b[height<={height}]/b"
     )
     hooks = {"progress_hooks": [on_progress]} if on_progress else {}
-    return _base_opts(service) | hooks | {
+    return _base_opts(service, with_cookies) | hooks | {
         "format": fmt,
         "outtmpl": str(workdir / "%(id)s.%(ext)s"),
         "merge_output_format": "mp4",
@@ -455,11 +484,34 @@ class ProgressReporter:
             log.debug("не смог обновить статус: %s", exc)
 
 
+def _with_cookie_retry(fn, url: str, workdir: Path, on_progress) -> tuple[Path, dict]:
+    """Первая попытка анонимная; если сервис потребовал вход — повторяем с cookies."""
+    service = service_of(url_key(url))
+    try:
+        return fn(url, workdir, on_progress, False)
+    except yt_dlp.utils.DownloadError as exc:
+        if has_cookie_fallback(service) and is_auth_error(exc):
+            log.info(
+                "[%s] требует вход (%s…) — повторяю с cookies",
+                service, ANSI_RE.sub("", str(exc))[:70],
+            )
+            return fn(url, workdir, on_progress, True)
+        raise
+
+
+def download_video(url: str, workdir: Path, on_progress=None) -> tuple[Path, dict]:
+    return _with_cookie_retry(_download_video, url, workdir, on_progress)
+
+
 def download_audio(url: str, workdir: Path, on_progress=None) -> tuple[Path, dict]:
+    return _with_cookie_retry(_download_audio, url, workdir, on_progress)
+
+
+def _download_audio(url: str, workdir: Path, on_progress, with_cookies: bool) -> tuple[Path, dict]:
     """Забирает только звуковую дорожку и кладёт её в mp3 с тегами и обложкой."""
     workdir.mkdir(parents=True, exist_ok=True)
     service = service_of(url_key(url))
-    with yt_dlp.YoutubeDL(_audio_opts(workdir, on_progress, service)) as ydl:
+    with yt_dlp.YoutubeDL(_audio_opts(workdir, on_progress, service, with_cookies)) as ydl:
         info = _pick_entry(ydl.extract_info(url, download=True))
     audio = next((f for f in workdir.glob("*.mp3")), None)
     if audio is None:  # постпроцессор не отработал — отдаём что скачалось
@@ -471,10 +523,10 @@ def download_audio(url: str, workdir: Path, on_progress=None) -> tuple[Path, dic
     return audio, info
 
 
-def download_video(url: str, workdir: Path, on_progress=None) -> tuple[Path, dict]:
+def _download_video(url: str, workdir: Path, on_progress, with_cookies: bool) -> tuple[Path, dict]:
     """Скачивает видео, подбирая качество так, чтобы файл влез в лимит Telegram."""
     service = service_of(url_key(url))
-    with yt_dlp.YoutubeDL(_base_opts(service)) as ydl:
+    with yt_dlp.YoutubeDL(_base_opts(service, with_cookies)) as ydl:
         probe = _pick_entry(ydl.extract_info(url, download=False))
     start_height = choose_start_height(probe)
     ladder = tuple(h for h in HEIGHT_LADDER if h <= start_height) or (HEIGHT_LADDER[-1],)
@@ -482,7 +534,9 @@ def download_video(url: str, workdir: Path, on_progress=None) -> tuple[Path, dic
         attempt_dir = workdir / f"h{height}"
         attempt_dir.mkdir(parents=True, exist_ok=True)
         try:
-            with yt_dlp.YoutubeDL(_ydl_opts(attempt_dir, height, on_progress, service)) as ydl:
+            with yt_dlp.YoutubeDL(
+                _ydl_opts(attempt_dir, height, on_progress, service, with_cookies)
+            ) as ydl:
                 info = _pick_entry(ydl.extract_info(url, download=True))
         except yt_dlp.utils.DownloadError as exc:
             if "max-filesize" in str(exc).lower():
@@ -542,6 +596,11 @@ def friendly_dlp_error(exc: yt_dlp.utils.DownloadError, service: str = "") -> st
             "похоже, наш IP временно придерживают. Подожди минут десять и пришли ссылку ещё раз."
         )
     if "confirm your age" in low or "age-restricted" in low:
+        if has_cookie_fallback("yt") or use_cookies_for("yt"):
+            return (
+                "🔞 У этого видео возрастное ограничение — YouTube не отдал его "
+                "даже с cookies аккаунта. Скачать не получится."
+            )
         return (
             "🔞 У этого видео возрастное ограничение — YouTube отдаёт его только "
             "залогиненным, а cookies YouTube у бота нет. Скачать не получится."
@@ -549,6 +608,11 @@ def friendly_dlp_error(exc: yt_dlp.utils.DownloadError, service: str = "") -> st
     if "404" in low and "not found" in low:
         return "🗑 Похоже, пост удалён или ссылка битая (404)."
     if "sign in to confirm" in low or "not a bot" in low:
+        if has_cookie_fallback("yt") or use_cookies_for("yt"):
+            return (
+                "🤖 YouTube требует вход, и даже cookies аккаунта не убедили его. "
+                "Возможно, сессия протухла — попробуй позже или выгрузи cookies заново."
+            )
         return (
             "🤖 YouTube принял меня за бота (что справедливо) и требует вход в аккаунт.\n"
             "Добавь cookies: переменная COOKIES_FILE в .env, инструкция в README."
