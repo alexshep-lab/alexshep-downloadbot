@@ -524,6 +524,11 @@ def friendly_dlp_error(exc: yt_dlp.utils.DownloadError, service: str = "") -> st
         )
     if "no video formats found" in low:
         return "🖼 В этом посте нет видео — только фото. Скачивать нечего."
+    if "400" in low and "bad request" in low:
+        return (
+            "🔑 Instagram разлогинил бота: сессия в cookies больше не действует.\n"
+            "Нужно заново выгрузить cookies.txt из браузера — до этого рилсы качаться не будут."
+        )
     if "empty media response" in low:
         return (
             "🔒 Instagram не отдал это видео анонимно — скорее всего, пост "
