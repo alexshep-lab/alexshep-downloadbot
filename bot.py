@@ -6,6 +6,7 @@
 import asyncio
 import hashlib
 import html
+import io
 import itertools
 import json
 import logging
@@ -15,6 +16,7 @@ import shutil
 import struct
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -413,11 +415,101 @@ def use_cookies_for(service: str) -> bool:
 
 
 def has_cookie_fallback(service: str) -> bool:
+    if service == "ig":
+        return ig_cookies_configured()
     return (
         bool(COOKIES_FILE)
         and service in COOKIES_FALLBACK_SERVICES
         and not use_cookies_for(service)
     )
+
+
+def ig_cookies_configured() -> bool:
+    return use_cookies_for("ig") or bool(COOKIES_FILE and "ig" in COOKIES_FALLBACK_SERVICES)
+
+
+IG_STATE_FILE = CACHE_FILE.with_name("instagram_session_state.json")
+ig_auth_lock = threading.RLock()
+ig_blocked_session: str | None = None
+ig_block_loaded = False
+
+
+class InstagramSessionUnavailable(yt_dlp.utils.DownloadError):
+    pass
+
+
+def ig_cookie_fingerprint() -> str | None:
+    """Идентификатор сессии без хранения самих cookies в файле состояния."""
+    if not ig_cookies_configured():
+        return None
+    try:
+        for raw in Path(COOKIES_FILE).read_text(encoding="utf-8").splitlines():
+            fields = raw.removeprefix("#HttpOnly_").split("\t")
+            if len(fields) != 7 or fields[0].lstrip(".") not in {"instagram.com", "www.instagram.com", "i.instagram.com"}:
+                continue
+            if fields[5] == "sessionid" and fields[6]:
+                expiry = float(fields[4] or 0)
+                if expiry and expiry <= time.time():
+                    return None
+                return hashlib.sha256(fields[6].encode()).hexdigest()
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def ig_auth_available() -> bool:
+    global ig_block_loaded, ig_blocked_session
+    with ig_auth_lock:
+        if not ig_block_loaded:
+            try:
+                state = json.loads(IG_STATE_FILE.read_text(encoding="utf-8"))
+                ig_blocked_session = state["blocked_session"]
+                if not isinstance(ig_blocked_session, str):
+                    raise ValueError("invalid session state")
+            except FileNotFoundError:
+                pass
+            except (OSError, ValueError, KeyError, TypeError):
+                # Повреждённый файл не должен незаметно включать заблокированный вход.
+                ig_blocked_session = "invalid-state"
+                log.warning("Не удалось прочитать состояние Instagram; вход отключён")
+            ig_block_loaded = True
+        fingerprint = ig_cookie_fingerprint()
+        return bool(fingerprint and ig_blocked_session not in (fingerprint, "invalid-state"))
+
+
+def block_ig_session(fingerprint: str) -> None:
+    global ig_blocked_session, ig_block_loaded
+    with ig_auth_lock:
+        ig_blocked_session, ig_block_loaded = fingerprint, True
+        temp = IG_STATE_FILE.with_suffix(".tmp")
+        try:
+            temp.write_text(json.dumps({"blocked_session": fingerprint}), encoding="utf-8")
+            os.replace(temp, IG_STATE_FILE)
+        except OSError as exc:
+            log.error("Не удалось сохранить блокировку Instagram: %s", safe_error(exc))
+
+
+def run_ig_authenticated(fn, url: str):
+    """Один запрос с аккаунтом за раз; checkpoint выключает сессию и после рестарта."""
+    with ig_auth_lock:
+        if not ig_auth_available():
+            raise InstagramSessionUnavailable("Instagram session disabled; anonymous access only")
+        fingerprint = ig_cookie_fingerprint()
+        if not fingerprint:
+            raise InstagramSessionUnavailable("Instagram session missing; anonymous access only")
+        try:
+            path, info = fn()
+        except yt_dlp.utils.DownloadError as exc:
+            low = str(exc).lower()
+            checkpoint = "checkpoint_required" in low or "challenge_required" in low
+            if not checkpoint and "400" in low and "bad request" in low:
+                checkpoint = ig_checkpoint(url)
+            if checkpoint:
+                block_ig_session(fingerprint)
+                raise InstagramSessionUnavailable("Instagram session disabled after checkpoint") from None
+            raise
+        info["_ig_authenticated"] = fingerprint
+        return path, info
 
 
 def cookie_expiry(domain: str, name: str) -> float | None:
@@ -442,23 +534,25 @@ def ig_session_alive() -> bool:
     return expiry is not None and (expiry == 0 or expiry > time.time())
 
 
-# последнее известное состояние сессии Instagram: ok | missing | checkpoint.
+# последнее известное состояние сессии Instagram: ready | ok | missing | checkpoint.
 # Храним, чтобы писать владельцу только о переменах.
 ig_session_state: str | None = None
 
 
 def ig_state_message(state: str) -> str:
     return {
-        "ok": "✅ Сессия Instagram снова работает — рилсы качаются с аккаунтом.",
+        "ok": "✅ Сессия Instagram проверена успешной загрузкой с аккаунтом. Публичные ролики по-прежнему пробую анонимно.",
+        "ready": "🔑 Обнаружена другая сессия Instagram. Бот попробует её, только если без входа скачать не получится.",
         "missing": (
             "🔑 Instagram разлогинил бота: в cookies больше нет сессии (sessionid).\n"
-            "Пока рилсы качаются анонимно — жди 429 и «недоступно для некоторых аудиторий».\n"
+            "Доступные публичные ролики и кеш продолжают работать без аккаунта.\n"
             f"Выгрузи cookies instagram.com заново и положи на сервер в <code>{html.escape(COOKIES_FILE)}</code>."
         ),
         "checkpoint": (
             "🔐 Instagram заблокировал вход в аккаунт бота и ждёт подтверждения «Это были вы?» "
-            "(checkpoint_required). Пока проверка не пройдена, рилсы с аккаунтом не качаются.\n"
-            "Открой этот аккаунт в приложении Instagram и подтверди вход — cookies менять не нужно."
+            "(checkpoint_required). Бот отключил эту сессию и продолжает работать анонимно и из кеша.\n"
+            "Восстанови вход в аккаунт и экспортируй свежие cookies. Подтверждение в приложении "
+            "само по себе не гарантирует восстановления серверной сессии."
         ),
     }[state]
 
@@ -473,11 +567,11 @@ async def notify_owners(bot: Bot, text: str) -> None:
 
 async def set_ig_state(bot: Bot, state: str) -> None:
     global ig_session_state
-    if not use_cookies_for("ig") or state == ig_session_state:
+    if not ig_cookies_configured() or state == ig_session_state:
         return
     previous, ig_session_state = ig_session_state, state
-    log.log(logging.INFO if state == "ok" else logging.WARNING, "сессия Instagram: %s", state)
-    if previous is None and state == "ok":  # при старте всё в порядке — молчим
+    log.log(logging.INFO if state in {"ok", "ready"} else logging.WARNING, "сессия Instagram: %s", state)
+    if previous is None and state in {"ok", "ready"}:
         return
     await notify_owners(bot, ig_state_message(state))
 
@@ -487,36 +581,47 @@ def ig_checkpoint(url: str) -> bool:
     pk = _ig_media_pk(url)
     if pk is None:
         return False
-    with yt_dlp.YoutubeDL(_base_opts("ig")) as ydl:
+    with yt_dlp.YoutubeDL(_base_opts("ig", with_cookies=True)) as ydl:
         request = yt_dlp.networking.Request(
             f"https://i.instagram.com/api/v1/media/{pk}/info/", headers=IG_API_HEADERS
         )
         try:
             ydl.urlopen(request).read()
         except yt_dlp.networking.exceptions.HTTPError as exc:
-            return "checkpoint_required" in exc.response.read(4000).decode(errors="replace")
+            body = exc.response.read(4000).decode(errors="replace")
+            return any(marker in body for marker in ("checkpoint_required", "challenge_required"))
         except Exception:
             return False
     return False
 
 
-async def check_ig_session(bot: Bot, failed_url: str | None = None) -> None:
-    """Проверяет сессию Instagram; failed_url — ссылка, на которой Instagram только что отказал."""
-    if not use_cookies_for("ig"):
+async def check_ig_session(bot: Bot) -> None:
+    """Только локальное состояние: анонимные ошибки не вызывают запрос с аккаунтом."""
+    if not ig_cookies_configured():
         return
-    if not ig_session_alive():
+    # Функция вызывается из event loop; не ждём здесь lock фоновой загрузки.
+    fingerprint = ig_cookie_fingerprint()
+    if not fingerprint:
         await set_ig_state(bot, "missing")
-    elif failed_url and await asyncio.to_thread(ig_checkpoint, failed_url):
+    elif ig_blocked_session in (fingerprint, "invalid-state"):
         await set_ig_state(bot, "checkpoint")
-    elif ig_session_state in (None, "missing"):
-        # cookies на месте; снятую проверку входа отсюда не увидеть — её подтвердит удачная закачка
-        await set_ig_state(bot, "ok")
+    elif ig_session_state in (None, "missing", "checkpoint"):
+        await set_ig_state(bot, "ready")
 
 
 async def watch_ig_session(bot: Bot) -> None:
     while True:
         await check_ig_session(bot)
         await asyncio.sleep(IG_SESSION_CHECK_MIN * 60)
+
+
+async def report_ig_result(bot: Bot, info: dict) -> None:
+    fingerprint = info.get("_ig_authenticated")
+    if (fingerprint and fingerprint == ig_cookie_fingerprint()
+            and ig_blocked_session not in (fingerprint, "invalid-state")):
+        await set_ig_state(bot, "ok")
+    else:
+        await check_ig_session(bot)
 
 
 AUTH_ERROR_MARKERS = (
@@ -545,7 +650,14 @@ def _base_opts(service: str = "", with_cookies: bool = False) -> dict:
         # при 429 каждый повтор только продлевает блокировку, поэтому их поменьше
         "extractor_retries": 1,
     }
-    if with_cookies or use_cookies_for(service):
+    if service == "ig":
+        if with_cookies:
+            if not ig_auth_available():
+                raise InstagramSessionUnavailable("Instagram session disabled; anonymous access only")
+            # yt-dlp сохраняет cookiejar при закрытии. Даем ему отдельную копию в памяти:
+            # ответы Instagram не стирают исходный экспорт и не гоняются с другими задачами.
+            opts["cookiefile"] = io.StringIO(Path(COOKIES_FILE).read_text(encoding="utf-8"))
+    elif with_cookies or use_cookies_for(service):
         opts["cookiefile"] = COOKIES_FILE
     if PROXY:
         opts["proxy"] = PROXY
@@ -1007,7 +1119,7 @@ def _ig_title(item: dict, music: dict | None) -> str:
 def _ig_music_only(url: str, workdir: Path, on_progress=None) -> tuple[Path, dict]:
     """«Только звук» для поста с фото: отдаём тот кусок трека, что звучит в посте."""
     workdir.mkdir(parents=True, exist_ok=True)
-    with yt_dlp.YoutubeDL(_base_opts("ig")) as ydl:
+    with yt_dlp.YoutubeDL(_base_opts("ig", with_cookies=True)) as ydl:
         item = _ig_post(ydl, url, workdir)
         music = _ig_music(item)
         if not music:
@@ -1035,7 +1147,7 @@ def build_ig_slideshow(url: str, workdir: Path, on_progress=None) -> tuple[Path,
     каждый слайд кодируем в одинаковый отрезок, склеиваем и накладываем музыку.
     """
     workdir.mkdir(parents=True, exist_ok=True)
-    with yt_dlp.YoutubeDL(_base_opts("ig")) as ydl:
+    with yt_dlp.YoutubeDL(_base_opts("ig", with_cookies=True)) as ydl:
         item = _ig_post(ydl, url, workdir)
         music = _ig_music(item)
         slides = item.get("carousel_media") or [item]
@@ -1134,11 +1246,18 @@ def _with_cookie_retry(fn, url: str, workdir: Path, on_progress) -> tuple[Path, 
     try:
         return fn(url, workdir, on_progress, False)
     except yt_dlp.utils.DownloadError as exc:
-        if has_cookie_fallback(service) and is_auth_error(exc):
+        ig_needs_login = service == "ig" and any(marker in str(exc).lower() for marker in (
+            "login required", "log in", "empty media response", "requested content is not available",
+            "private", "400: bad request",
+        ))
+        if (has_cookie_fallback(service) and (is_auth_error(exc) or ig_needs_login)
+                and not (service == "ig" and is_rate_limited(exc))):
             log.info(
                 "[%s] отказ анонимному запросу (%s…) — повторяю с cookies",
                 service, safe_error(exc, 70),
             )
+            if service == "ig":
+                return run_ig_authenticated(lambda: fn(url, workdir, on_progress, True), url)
             return fn(url, workdir, on_progress, True)
         raise
 
@@ -1149,11 +1268,11 @@ def _with_photo_fallback(fn, fallback, url: str, workdir: Path, on_progress) -> 
         return _with_cookie_retry(fn, url, workdir, on_progress)
     except yt_dlp.utils.DownloadError as exc:
         # музыку API Instagram отдаёт только залогиненным — без cookies и пробовать нечего
-        if service_of(url_key(url)) != "ig" or not is_no_video_error(exc) or not use_cookies_for("ig"):
+        if service_of(url_key(url)) != "ig" or not is_no_video_error(exc) or not ig_cookies_configured():
             raise
         log.info("[%s] видео в посте нет — пробую фото с музыкой", url_key(url))
         try:
-            return fallback(url, workdir, on_progress)
+            return run_ig_authenticated(lambda: fallback(url, workdir, on_progress), url)
         except yt_dlp.utils.DownloadError as fallback_exc:
             if is_no_video_error(fallback_exc):
                 raise exc from None  # музыки нет — отвечаем исходной ошибкой «только фото»
@@ -1234,6 +1353,11 @@ def is_rate_limited(exc: yt_dlp.utils.DownloadError) -> bool:
 def friendly_dlp_error(exc: yt_dlp.utils.DownloadError, service: str = "") -> str:
     text = ANSI_RE.sub("", str(exc)).removeprefix("ERROR: ").strip()
     low = text.lower()
+    if isinstance(exc, InstagramSessionUnavailable):
+        return (
+            "🔒 Без входа этот материал скачать не удалось, а сессия Instagram сейчас отключена. "
+            "Другие публичные ролики и файлы из кеша продолжают работать."
+        )
     if is_rate_limited(exc):
         name = SERVICE_NAMES.get(service, "Сервис")
         return (
@@ -1243,7 +1367,7 @@ def friendly_dlp_error(exc: yt_dlp.utils.DownloadError, service: str = "") -> st
             f"повторять сейчас бесполезно, от этого блокировка только продлевается."
         )
     if is_no_video_error(exc):
-        if service == "ig" and not use_cookies_for("ig"):
+        if service == "ig" and not ig_cookies_configured():
             # без аккаунта музыку поста не проверить, так что «музыки нет» было бы враньём
             return (
                 "🖼 В этом посте нет видео, только фото. Если там есть музыка, собрать из неё "
@@ -1251,14 +1375,9 @@ def friendly_dlp_error(exc: yt_dlp.utils.DownloadError, service: str = "") -> st
             )
         return "🖼 В этом посте только фото, без видео и музыки. Скачивать нечего."
     if "400" in low and "bad request" in low:
-        if ig_session_state == "checkpoint":
-            return (
-                "🔐 Instagram заблокировал вход в аккаунт бота до подтверждения «Это были вы?». "
-                "Владелец уже в курсе — как подтвердит, рилсы снова начнут качаться."
-            )
         return (
-            "🔑 Instagram разлогинил бота: сессия в cookies больше не действует.\n"
-            "Нужно заново выгрузить cookies.txt из браузера — до этого рилсы качаться не будут."
+            "⚠️ Сервис отклонил запрос на этот материал. HTTP 400 сам по себе "
+            "не означает, что аккаунт заблокирован."
         )
     if "empty media response" in low:
         return (
@@ -1536,7 +1655,7 @@ async def download_and_send(
             if sent_ids:
                 cache_put_album(key, kind, sent_ids, title)
             if service_of(key) == "ig":
-                await set_ig_state(message.bot, "ok")
+                await report_ig_result(message.bot, info)
             log.info(
                 "[%s/%s] готово за %s: альбом из %d, для %s",
                 key, kind, fmt_time(time.monotonic() - started), len(album), who,
@@ -1572,8 +1691,8 @@ async def download_and_send(
         media = sent.audio if kind == "audio" else sent.video
         if media:  # запомним, чтобы второй раз не качать
             cache_put(key, kind, media.file_id, title)
-        if service_of(key) == "ig":  # с проверкой входа Instagram не отдал бы ничего
-            await set_ig_state(message.bot, "ok")
+        if service_of(key) == "ig":
+            await report_ig_result(message.bot, info)
         log.info(
             "[%s/%s] готово за %s: %s, %s, для %s",
             key, kind, fmt_time(time.monotonic() - started), fmt_size(size),
@@ -1614,9 +1733,8 @@ async def download_and_send(
             )
         else:
             log.warning("yt-dlp error for %s: %s", safe_url_for_log(url), safe_error(exc))
-        if service == "ig":  # отказ Instagram — частый признак, что сессию стёрли или заблокировали
-            low = str(exc).lower()
-            await check_ig_session(message.bot, url if "400" in low and "bad request" in low else None)
+        if service == "ig":
+            await check_ig_session(message.bot)
         await show_error(status, friendly_dlp_error(exc, service))
     except TelegramNetworkError as exc:
         log.warning("upload failed for %s: %s", safe_url_for_log(url), safe_error(exc))
@@ -1715,6 +1833,7 @@ def validate_security_config() -> None:
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     validate_security_config()
+    ig_auth_available()  # загрузить сохранённую блокировку до фоновых задач и polling
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     load_cache()
     session = None
