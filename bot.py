@@ -1,9 +1,10 @@
-"""AlexShepDownloadBot — Telegram-бот для скачивания видео из YouTube и Instagram.
+"""AlexShepDownloadBot — Telegram-бот для скачивания видео из YouTube, Instagram, TikTok и X.
 
 Запуск: python bot.py (настройки берутся из .env, см. .env.example).
 """
 
 import asyncio
+import hashlib
 import html
 import itertools
 import json
@@ -11,6 +12,8 @@ import logging
 import os
 import re
 import shutil
+import struct
+import subprocess
 import tempfile
 import time
 import uuid
@@ -30,6 +33,8 @@ from aiogram.types import (
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaPhoto,
+    InputMediaVideo,
     Message,
 )
 from dotenv import load_dotenv
@@ -57,11 +62,16 @@ COOKIES_FALLBACK_SERVICES = {
     s for s in os.getenv("COOKIES_FALLBACK_SERVICES", "yt").replace(" ", "").lower().split(",") if s
 }
 PROXY = os.getenv("PROXY", "").strip()
-ALLOW_ANY_SITE = os.getenv("ALLOW_ANY_SITE", "").strip().lower() in {"1", "true", "yes"}
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR") or Path(tempfile.gettempdir()) / "alexshep_download_bot")
 DOWNLOAD_TIMEOUT = int(os.getenv("DOWNLOAD_TIMEOUT", "900"))
 UPLOAD_TIMEOUT = int(os.getenv("UPLOAD_TIMEOUT", "600"))
 MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "2"))
+# Сколько запросов может одновременно выполняться или ждать своей очереди.
+# Семафор ниже ограничивает только сами скачивания, поэтому без отдельного потолка
+# один пользователь мог бы создать неограниченное число ожидающих asyncio-задач.
+MAX_PENDING_REQUESTS = int(os.getenv("MAX_PENDING_REQUESTS", "12"))
+MAX_REQUESTS_PER_USER = int(os.getenv("MAX_REQUESTS_PER_USER", "3"))
+MAX_CACHE_ENTRIES = int(os.getenv("MAX_CACHE_ENTRIES", "5000"))
 # адрес локального Bot API server (например http://127.0.0.1:8081); пусто = облачный Telegram
 TELEGRAM_API_URL = os.getenv("TELEGRAM_API_URL", "").strip()
 # 50 МБ у облачного Bot API, до 2000 МБ у локального
@@ -79,12 +89,18 @@ THROTTLE_FLOOR_KB = int(os.getenv("THROTTLE_FLOOR_KB", "500"))
 RATE_LIMIT_COOLDOWN_MIN = int(os.getenv("RATE_LIMIT_COOLDOWN_MIN", "30"))
 # в группах сообщения об ошибках самоудаляются через столько секунд (0 = висят всегда)
 ERROR_TTL_SEC = int(os.getenv("ERROR_TTL_SEC", "60"))
+# Telegram на iPhone не играет VP9/AV1 и 10-битный H.264: такое перекодируем в H.264,
+# но только ролики не длиннее этого: 2 ядра кодируют 1080p чуть медленнее реального времени
+TRANSCODE_MAX_DURATION_MIN = int(os.getenv("TRANSCODE_MAX_DURATION_MIN", "5"))
+# как часто проверять, что сессия Instagram в cookies ещё жива, минут
+IG_SESSION_CHECK_MIN = int(os.getenv("IG_SESSION_CHECK_MIN", "60"))
 
 DOWNLOAD_ATTEMPTS = 3  # сколько раз пробовать при временных ошибках (403 и т.п.)
 RETRY_DELAYS = (15, 45)  # паузы перед 2-й и 3-й попыткой, сек
 
 MAX_FILE_SIZE = MAX_FILE_SIZE_MB * 1024 * 1024
 SIZE_TARGET = int(MAX_FILE_SIZE * 0.96)  # целимся с запасом под лимит
+MAX_METADATA_SIZE = 5 * 1024 * 1024
 HEIGHT_LADDER = tuple(h for h in (2160, 1440, 1080, 720, 480, 360) if h <= MAX_HEIGHT) or (360,)
 
 URL_RE = re.compile(r"https?://\S+")
@@ -97,11 +113,20 @@ SUPPORTED_HOSTS = (
 log = logging.getLogger("downloadbot")
 router = Router()
 download_slots = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+request_state_lock = asyncio.Lock()
+pending_requests = 0
+pending_by_user: dict[int, int] = {}
 
 # одно и то же видео качаем один раз: второй чат ждёт на замке и получает готовый file_id
 CACHE_FILE = Path(os.getenv("CACHE_FILE") or "file_ids.json")
 file_ids: dict[str, dict] = {}  # ключ → {"file_id": …, "title": …}
-url_locks: dict[str, asyncio.Lock] = {}
+class UrlLock:
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.refs = 0
+
+
+url_locks: dict[str, UrlLock] = {}
 jobs: dict[str, "Job"] = {}  # идущие закачки, чтобы их можно было отменить кнопкой
 job_counter = itertools.count(1)
 
@@ -151,8 +176,28 @@ def cache_get(key: str, kind: str) -> dict | None:
     return entry
 
 
+def trim_cache() -> bool:
+    trimmed = False
+    while len(file_ids) > MAX_CACHE_ENTRIES:
+        file_ids.pop(next(iter(file_ids)))
+        trimmed = True
+    return trimmed
+
+
 def cache_put(key: str, kind: str, file_id: str, title: str) -> None:
-    file_ids[cache_key(key, kind)] = {"file_id": file_id, "title": title}
+    full_key = cache_key(key, kind)
+    file_ids.pop(full_key, None)  # повторная запись становится самой свежей
+    file_ids[full_key] = {"file_id": file_id, "title": title}
+    trim_cache()
+    save_cache()
+
+
+def cache_put_album(key: str, kind: str, album: list[list[str]], title: str) -> None:
+    """Альбом фото поста: [["photo", file_id], ["video", file_id], …]."""
+    full_key = cache_key(key, kind)
+    file_ids.pop(full_key, None)
+    file_ids[full_key] = {"album": album, "title": title}
+    trim_cache()
     save_cache()
 rate_limited_until: dict[str, float] = {}  # "ig"/"yt" → до какого времени не трогать
 
@@ -170,19 +215,35 @@ def cooldown_left(service: str) -> float:
 
 def load_cache() -> None:
     try:
-        file_ids.update(json.loads(CACHE_FILE.read_text(encoding="utf-8")))
+        loaded = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict):
+            raise ValueError("корень кеша должен быть объектом")
+        file_ids.update(loaded)
+        if trim_cache():
+            save_cache()
         log.info("кеш отправленных видео: %d записей", len(file_ids))
     except FileNotFoundError:
         pass
     except Exception as exc:
-        log.warning("не смог прочитать кеш %s: %s", CACHE_FILE, exc)
+        log.warning("не смог прочитать кеш %s: %s", CACHE_FILE, safe_error(exc))
 
 
 def save_cache() -> None:
+    temp = CACHE_FILE.with_name(f".{CACHE_FILE.name}.tmp")
     try:
-        CACHE_FILE.write_text(json.dumps(file_ids, ensure_ascii=False), encoding="utf-8")
+        temp.write_text(json.dumps(file_ids, ensure_ascii=False), encoding="utf-8")
+        os.replace(temp, CACHE_FILE)
     except Exception as exc:
-        log.warning("не смог сохранить кеш: %s", exc)
+        temp.unlink(missing_ok=True)
+        log.warning("не смог сохранить кеш: %s", safe_error(exc))
+
+
+def safe_key_part(value: str) -> str:
+    """Оставляет читаемые media id, но не допускает управляющие символы в кеш и лог."""
+    if re.fullmatch(r"[A-Za-z0-9_.@-]{1,128}", value):
+        return value
+    digest = hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()[:24]
+    return f"hash-{digest}"
 
 
 def url_key(url: str) -> str:
@@ -191,31 +252,41 @@ def url_key(url: str) -> str:
     host = parts.netloc.lower().removeprefix("www.")
     path = [p for p in parts.path.split("/") if p]
     if host == "youtu.be" and path:
-        return f"yt:{path[0]}"
+        return f"yt:{safe_key_part(path[0])}"
     if host.endswith("youtube.com"):
         video_id = parse_qs(parts.query).get("v")
         if video_id:
-            return f"yt:{video_id[0]}"
+            return f"yt:{safe_key_part(video_id[0])}"
         if len(path) >= 2 and path[0] in ("shorts", "live", "embed"):
-            return f"yt:{path[1]}"
-    if "instagram" in host and len(path) >= 2:
+            return f"yt:{safe_key_part(path[1])}"
+    if "instagram" in host and path:
         # весь путь целиком: у историй он вида /stories/автор/id, и по первым двум
         # сегментам разные истории одного автора слились бы в один ключ
-        return "ig:" + ":".join(path)
+        return "ig:" + ":".join(safe_key_part(part) for part in path)
     if host.endswith("tiktok.com") and path:
         # /@user/video/123456 — длинная ссылка; vm./vt./t/КОД — короткая, ключуем по коду
         if "video" in path and len(path) > path.index("video") + 1:
-            return f"tt:{path[path.index('video') + 1]}"
-        return f"tt:{path[-1]}"
+            return f"tt:{safe_key_part(path[path.index('video') + 1])}"
+        return f"tt:{safe_key_part(path[-1])}"
     if host.endswith(("x.com", "twitter.com")) and "status" in path:
         # /username/status/123456 — имя автора в ключ не берём, важен только id поста
         status_at = path.index("status")
         if len(path) > status_at + 1:
-            return f"x:{path[status_at + 1]}"
-    # ссылка незнакомого вида: берём и путь, и параметры. Без параметров, например,
-    # два разных плейлиста YouTube дали бы один ключ и кеш вернул бы чужое видео
-    tail = f"?{parts.query}" if parts.query else ""
-    return f"{host}{parts.path}".rstrip("/") + tail
+            return f"x:{safe_key_part(path[status_at + 1])}"
+    # Для неизвестного пути сохраняем только хеш: query может содержать приватный
+    # share-токен, а ключ попадает в кеш и логи.
+    if host == "youtu.be" or host.endswith("youtube.com"):
+        service = "yt"
+    elif host.endswith(("instagram.com", "instagr.am")):
+        service = "ig"
+    elif host.endswith("tiktok.com"):
+        service = "tt"
+    elif host.endswith(("x.com", "twitter.com")):
+        service = "x"
+    else:
+        service = "url"
+    digest = hashlib.sha256(url.encode("utf-8", errors="replace")).hexdigest()[:24]
+    return f"{service}:url:{digest}"
 
 WELCOME = (
     "Привет! Пришли мне ссылку на видео из YouTube (в т.ч. Shorts), "
@@ -231,17 +302,82 @@ class TooLargeError(Exception):
 
 
 def is_allowed(message: Message) -> bool:
-    if not ALLOWED_USER_IDS and not ALLOWED_CHAT_IDS:
-        return True
     if message.from_user and message.from_user.id in ALLOWED_USER_IDS:
         return True
     return message.chat.id in ALLOWED_CHAT_IDS
+
+
+def requester_id_of(message: Message) -> int:
+    """Стабильный ключ для лимита: пользователь, а для анонимного сообщения — чат."""
+    if message.from_user:
+        return message.from_user.id
+    if message.sender_chat:
+        return message.sender_chat.id
+    return message.chat.id
+
+
+async def reserve_request(requester_id: int) -> str | None:
+    """Резервирует место в очереди; возвращает причину отказа или None."""
+    global pending_requests
+    async with request_state_lock:
+        if pending_requests >= MAX_PENDING_REQUESTS:
+            return "global"
+        if pending_by_user.get(requester_id, 0) >= MAX_REQUESTS_PER_USER:
+            return "user"
+        pending_requests += 1
+        pending_by_user[requester_id] = pending_by_user.get(requester_id, 0) + 1
+    return None
+
+
+async def release_request(requester_id: int) -> None:
+    global pending_requests
+    async with request_state_lock:
+        pending_requests = max(0, pending_requests - 1)
+        left = pending_by_user.get(requester_id, 0) - 1
+        if left > 0:
+            pending_by_user[requester_id] = left
+        else:
+            pending_by_user.pop(requester_id, None)
+
+
+def retain_url_lock(key: str) -> UrlLock:
+    entry = url_locks.get(key)
+    if entry is None:
+        entry = url_locks[key] = UrlLock()
+    entry.refs += 1
+    return entry
+
+
+def release_url_lock(key: str, entry: UrlLock) -> None:
+    entry.refs -= 1
+    if entry.refs == 0 and url_locks.get(key) is entry:
+        url_locks.pop(key, None)
 
 
 def one_line(text: str | None, limit: int = 64) -> str:
     """Имена и названия чатов задаёт посторонний: переносы строк из них
     позволили бы дописывать в лог поддельные строки."""
     return " ".join((text or "").split())[:limit]
+
+
+def safe_url_for_log(url: str, limit: int = 300) -> str:
+    """URL без пароля, query и fragment: их содержимое нередко является секретом."""
+    try:
+        parts = urlparse(url)
+        host = (parts.hostname or "").lower()
+        if not host:
+            return "<invalid-url>"
+        value = f"{parts.scheme.lower()}://{host}{parts.path or '/'}"
+    except (TypeError, ValueError):
+        return "<invalid-url>"
+    return one_line(value, limit)
+
+
+def safe_error(exc: BaseException, limit: int = 300) -> str:
+    """Убирает URL-токены и переносы строк из текста внешней ошибки перед логированием."""
+    text = ANSI_RE.sub("", str(exc))
+    text = URL_RE.sub(lambda match: safe_url_for_log(match.group(0)), text)
+    return one_line(text, limit)
 
 
 def describe_sender(message: Message) -> str:
@@ -259,7 +395,16 @@ def describe_sender(message: Message) -> str:
 
 
 def is_supported(url: str) -> bool:
-    host = urlparse(url).netloc.lower().removeprefix("www.")
+    try:
+        parts = urlparse(url)
+        host = (parts.hostname or "").lower().removeprefix("www.")
+        port = parts.port
+    except ValueError:
+        return False
+    if parts.scheme.lower() != "https" or parts.username or parts.password:
+        return False
+    if port not in (None, 443):
+        return False
     return any(host == h or host.endswith("." + h) for h in SUPPORTED_HOSTS)
 
 
@@ -275,9 +420,112 @@ def has_cookie_fallback(service: str) -> bool:
     )
 
 
+def cookie_expiry(domain: str, name: str) -> float | None:
+    """Когда истекает cookie из COOKIES_FILE (0 — до закрытия браузера); None — её нет."""
+    try:
+        lines = Path(COOKIES_FILE).read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        line = line.removeprefix("#HttpOnly_")  # так Netscape-формат помечает httpOnly cookies
+        fields = line.split("\t")
+        if line.startswith("#") or len(fields) != 7:
+            continue
+        if fields[0].lstrip(".").endswith(domain) and fields[5] == name and fields[6]:
+            return float(fields[4] or 0)
+    return None
+
+
+def ig_session_alive() -> bool:
+    """Instagram разлогинивает, стирая sessionid: yt-dlp послушно удаляет её из файла."""
+    expiry = cookie_expiry("instagram.com", "sessionid")
+    return expiry is not None and (expiry == 0 or expiry > time.time())
+
+
+# последнее известное состояние сессии Instagram: ok | missing | checkpoint.
+# Храним, чтобы писать владельцу только о переменах.
+ig_session_state: str | None = None
+
+
+def ig_state_message(state: str) -> str:
+    return {
+        "ok": "✅ Сессия Instagram снова работает — рилсы качаются с аккаунтом.",
+        "missing": (
+            "🔑 Instagram разлогинил бота: в cookies больше нет сессии (sessionid).\n"
+            "Пока рилсы качаются анонимно — жди 429 и «недоступно для некоторых аудиторий».\n"
+            f"Выгрузи cookies instagram.com заново и положи на сервер в <code>{html.escape(COOKIES_FILE)}</code>."
+        ),
+        "checkpoint": (
+            "🔐 Instagram заблокировал вход в аккаунт бота и ждёт подтверждения «Это были вы?» "
+            "(checkpoint_required). Пока проверка не пройдена, рилсы с аккаунтом не качаются.\n"
+            "Открой этот аккаунт в приложении Instagram и подтверди вход — cookies менять не нужно."
+        ),
+    }[state]
+
+
+async def notify_owners(bot: Bot, text: str) -> None:
+    for user_id in ALLOWED_USER_IDS:
+        try:
+            await bot.send_message(user_id, text)
+        except Exception as exc:  # владелец не запускал бота в личке и т.п.
+            log.warning("не смог написать владельцу %s: %s", user_id, safe_error(exc))
+
+
+async def set_ig_state(bot: Bot, state: str) -> None:
+    global ig_session_state
+    if not use_cookies_for("ig") or state == ig_session_state:
+        return
+    previous, ig_session_state = ig_session_state, state
+    log.log(logging.INFO if state == "ok" else logging.WARNING, "сессия Instagram: %s", state)
+    if previous is None and state == "ok":  # при старте всё в порядке — молчим
+        return
+    await notify_owners(bot, ig_state_message(state))
+
+
+def ig_checkpoint(url: str) -> bool:
+    """Отказ из-за проверки входа? yt-dlp пишет только «400 Bad Request», причина — в теле ответа API."""
+    pk = _ig_media_pk(url)
+    if pk is None:
+        return False
+    with yt_dlp.YoutubeDL(_base_opts("ig")) as ydl:
+        request = yt_dlp.networking.Request(
+            f"https://i.instagram.com/api/v1/media/{pk}/info/", headers=IG_API_HEADERS
+        )
+        try:
+            ydl.urlopen(request).read()
+        except yt_dlp.networking.exceptions.HTTPError as exc:
+            return "checkpoint_required" in exc.response.read(4000).decode(errors="replace")
+        except Exception:
+            return False
+    return False
+
+
+async def check_ig_session(bot: Bot, failed_url: str | None = None) -> None:
+    """Проверяет сессию Instagram; failed_url — ссылка, на которой Instagram только что отказал."""
+    if not use_cookies_for("ig"):
+        return
+    if not ig_session_alive():
+        await set_ig_state(bot, "missing")
+    elif failed_url and await asyncio.to_thread(ig_checkpoint, failed_url):
+        await set_ig_state(bot, "checkpoint")
+    elif ig_session_state in (None, "missing"):
+        # cookies на месте; снятую проверку входа отсюда не увидеть — её подтвердит удачная закачка
+        await set_ig_state(bot, "ok")
+
+
+async def watch_ig_session(bot: Bot) -> None:
+    while True:
+        await check_ig_session(bot)
+        await asyncio.sleep(IG_SESSION_CHECK_MIN * 60)
+
+
 AUTH_ERROR_MARKERS = (
     "sign in", "not a bot", "confirm your age", "age-restricted",
     "login required", "members-only", "members only",
+    # YouTube больше не отдаёт видео анонимно с серверных IP: без cookies yt-dlp
+    # скатывается на клиент android_vr (у остальных нет PO-токена), и загрузка
+    # обрывается на ~10 МБ. Формально это не «нужен вход», но лечится ровно так же.
+    "403: forbidden",
 )
 
 
@@ -324,16 +572,25 @@ def _audio_opts(
 
 
 def _ydl_opts(
-    workdir: Path, height: int, on_progress=None, service: str = "", with_cookies: bool = False
+    workdir: Path,
+    height: int,
+    on_progress=None,
+    service: str = "",
+    with_cookies: bool = False,
+    side: str = "height",
 ) -> dict:
     # H.264 в приоритете: YouTube отдаёт AV1 примерно в 10 раз медленнее,
-    # да и играется H.264 на любом клиенте Telegram
+    # а iPhone VP9/AV1 не играет вовсе. Качество ограничиваем по короткой стороне,
+    # иначе вертикальный 1080×1920 не проходит фильтр «≤1080» и качается в 480p.
+    limit = f"[{side}<={height}]"
     fmt = (
-        f"bv*[height<={height}][vcodec^=avc1]+ba[ext=m4a]/"
-        f"bv*[height<={height}][vcodec^=avc1]+ba/"
-        f"bv*[height<={height}][ext=mp4]+ba[ext=m4a]/"
-        f"bv*[height<={height}]+ba/"
-        f"b[height<={height}]/b"
+        f"bv*{limit}[vcodec^=avc1]+ba[ext=m4a]/"
+        f"bv*{limit}[vcodec^=avc1]+ba/"
+        # готовый файл со звуком раньше раздельных дорожек неизвестного кодека:
+        # у Instagram он H.264, хоть и не подписан, а DASH-дорожки там — VP9
+        f"b{limit}/"
+        f"bv*{limit}+ba/"
+        "b"
     )
     hooks = {"progress_hooks": [on_progress]} if on_progress else {}
     return _base_opts(service, with_cookies) | hooks | {
@@ -369,16 +626,27 @@ def _result_file(info: dict) -> Path | None:
     return None
 
 
-def _estimate_size(info: dict, height: int) -> int | None:
-    """Грубая оценка размера видео на высоте height в байтах (None, если данных нет)."""
+def short_side(info: dict) -> str:
+    """Какое измерение ограничивать качеством: у вертикального видео короткая сторона — ширина."""
+    width, height = info.get("width") or 0, info.get("height") or 0
+    if not (width and height):
+        sized = [f for f in info.get("formats") or [] if f.get("width") and f.get("height")]
+        if sized:
+            biggest = max(sized, key=lambda f: f["width"] * f["height"])
+            width, height = biggest["width"], biggest["height"]
+    return "width" if 0 < width < height else "height"
+
+
+def _estimate_size(info: dict, height: int, side: str = "height") -> int | None:
+    """Грубая оценка размера видео в качестве height, байт (None, если данных нет)."""
     duration = info.get("duration")
     candidates = [
         f for f in info.get("formats") or []
-        if f.get("vcodec") not in (None, "none") and 0 < (f.get("height") or 0) <= height
+        if f.get("vcodec") not in (None, "none") and 0 < (f.get(side) or 0) <= height
     ]
     if not candidates:
         return None
-    best = max(candidates, key=lambda f: ((f.get("height") or 0), (f.get("tbr") or 0)))
+    best = max(candidates, key=lambda f: ((f.get(side) or 0), (f.get("tbr") or 0)))
     size = best.get("filesize") or best.get("filesize_approx")
     if not size and best.get("tbr") and duration:
         size = best["tbr"] * 1000 / 8 * duration
@@ -397,7 +665,7 @@ def choose_start_height(info: dict) -> int:
     if duration > HD_MAX_DURATION_MIN * 60:
         log.info("видео длиннее %d мин → качаю в %dp", HD_MAX_DURATION_MIN, PREFERRED_HEIGHT)
         return PREFERRED_HEIGHT
-    estimate = _estimate_size(info, MAX_HEIGHT)
+    estimate = _estimate_size(info, MAX_HEIGHT, short_side(info))
     if estimate and estimate > HD_MAX_SIZE_MB * 1024 * 1024:
         log.info(
             "в %dp это ~%d МБ (> %d МБ) → качаю в %dp",
@@ -447,6 +715,15 @@ class ProgressReporter:
         if status == "finished":
             self._show("⏳ Обрабатываю видео…")
             return
+        if status == "converting":
+            self._show("🔄 Перекодирую видео, чтобы оно играло и на iPhone…")
+            return
+        if status == "slideshow":
+            self._show("🎞 В посте фото с музыкой — собираю из них видео…")
+            return
+        if status == "photos":
+            self._show("🖼 В посте только фото — забираю их…")
+            return
         if status != "downloading":
             return
         if time.monotonic() - self._last_at < PROGRESS_INTERVAL:
@@ -484,27 +761,411 @@ class ProgressReporter:
             log.debug("не смог обновить статус: %s", exc)
 
 
+IOS_VIDEO_CODECS = {"h264"}
+IOS_PIX_FMTS = {"yuv420p", "yuvj420p"}  # 10-битный H.264 (yuv420p10le) iPhone не декодирует
+IOS_AUDIO_CODECS = {"aac", "mp3"}
+
+
+def _moov_first(path: Path) -> bool:
+    """Индекс mp4 (moov) лежит до данных (mdat)? Иначе видео не стримится, пока не скачано целиком."""
+    with path.open("rb") as f:
+        while header := f.read(8):
+            if len(header) < 8:
+                return False
+            size, kind = struct.unpack(">I4s", header)
+            if kind == b"moov":
+                return True
+            if kind == b"mdat":
+                return False
+            if size == 1:  # размер бокса не влез в 32 бита
+                size = struct.unpack(">Q", f.read(8))[0] - 8
+            elif size < 8:
+                return False
+            f.seek(size - 8, os.SEEK_CUR)
+    return False
+
+
+def _run_ffmpeg(args: list[str], on_progress, status: str = "converting") -> None:
+    """ffmpeg в фоне; раз в секунду дёргаем хук, чтобы работала кнопка «Отменить»."""
+    proc = subprocess.Popen(
+        ["ffmpeg", "-y", "-hide_banner", "-v", "error", *args],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+    )
+    try:
+        while True:
+            try:
+                _, err = proc.communicate(timeout=1)
+                break
+            except subprocess.TimeoutExpired:
+                if on_progress:
+                    on_progress({"status": status})
+    except BaseException:
+        proc.kill()
+        proc.wait()
+        raise
+    if proc.returncode:
+        tail = err.decode(errors="replace").strip()[-300:]
+        raise yt_dlp.utils.DownloadError(f"ffmpeg не смог обработать видео: {tail}")
+
+
+def make_ios_compatible(path: Path, info: dict, on_progress=None) -> Path:
+    """Приводит видео к тому, что Telegram играет везде: H.264 8 бит + AAC, moov в начале.
+
+    Заодно берёт размеры и длительность из самого файла: yt-dlp их знает не всегда,
+    а без них Telegram показывает ролик квадратом или без превью.
+    """
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-print_format", "json", "-show_streams", "-show_format", str(path)],
+        capture_output=True, text=True, timeout=60,
+    )
+    media = json.loads(probe.stdout or "{}")
+    streams = media.get("streams") or []
+    video = next(
+        (s for s in streams
+         if s.get("codec_type") == "video" and not (s.get("disposition") or {}).get("attached_pic")),
+        None,
+    )
+    if video is None:
+        return path
+    audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
+    info["width"], info["height"] = video.get("width"), video.get("height")
+    duration = float((media.get("format") or {}).get("duration") or 0)
+    if duration:
+        info["duration"] = duration
+
+    video_ok = video.get("codec_name") in IOS_VIDEO_CODECS and video.get("pix_fmt") in IOS_PIX_FMTS
+    audio_ok = audio is None or audio.get("codec_name") in IOS_AUDIO_CODECS
+    if video_ok and audio_ok and _moov_first(path):
+        return path
+    if not video_ok and duration > TRANSCODE_MAX_DURATION_MIN * 60:
+        log.info(
+            "%s в %s/%s, но длиннее %d мин — отправляю как есть",
+            path.name, video.get("codec_name"), video.get("pix_fmt"), TRANSCODE_MAX_DURATION_MIN,
+        )
+        return path
+
+    if video_ok:
+        video_args = ["-c:v", "copy"]
+    else:
+        video_args = [
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
+            # у yuv420p обе стороны должны быть чётными
+            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+        ]
+    audio_args = ["-c:a", "copy"] if audio_ok else ["-c:a", "aac", "-b:a", "160k"]
+    log.info(
+        "%s: видео %s/%s → %s, звук %s → %s",
+        path.name, video.get("codec_name"), video.get("pix_fmt"), "copy" if video_ok else "h264",
+        audio.get("codec_name") if audio else "—", "copy" if audio_ok else "aac",
+    )
+    out = path.with_name(f"{path.stem}.tg.mp4")
+    _run_ffmpeg(
+        ["-i", str(path), "-map", "0:v:0", "-map", "0:a:0?", *video_args, *audio_args,
+         "-movflags", "+faststart", str(out)],
+        on_progress,
+    )
+    path.unlink(missing_ok=True)
+    return out
+
+
+IG_API_HEADERS = {
+    "X-IG-App-ID": "936619743392459",  # id веб-клиента Instagram, тот же шлёт и сам yt-dlp
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/139.0 Safari/537.36"
+    ),
+}
+IG_SHORTCODE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+NO_VIDEO_MARKERS = ("no video formats found", "there is no video in this post")
+SLIDE_SEC = 3  # сколько показывать фото в карусели
+SLIDE_MAX_SEC = 6  # фото мало, а музыки много — растягиваем, но не до бесконечности
+SLIDESHOW_FPS = 25
+SLIDESHOW_MAX_SEC = 180
+SLIDESHOW_SIDE = 1080  # ширина кадра слайд-шоу
+
+
+def is_no_video_error(exc: yt_dlp.utils.DownloadError) -> bool:
+    low = ANSI_RE.sub("", str(exc)).lower()
+    return any(marker in low for marker in NO_VIDEO_MARKERS)
+
+
+def _ig_media_pk(url: str) -> int | None:
+    """id поста для API: shortcode из ссылки — это число в base64 (у приватных после 11 символов хвост)."""
+    path = [p for p in urlparse(url).path.split("/") if p]
+    for marker in ("p", "reel", "reels", "tv"):
+        if marker in path and len(path) > path.index(marker) + 1:
+            pk = 0
+            for char in path[path.index(marker) + 1][:11]:
+                if char not in IG_SHORTCODE_ALPHABET:
+                    return None
+                pk = pk * 64 + IG_SHORTCODE_ALPHABET.index(char)
+            return pk
+    return None
+
+
+def _copy_limited(source, target, max_bytes: int) -> None:
+    """Копирует сетевой ответ, не позволяя неизвестному размеру заполнить диск."""
+    content_length = source.headers.get("Content-Length")
+    try:
+        if content_length and int(content_length) > max_bytes:
+            raise TooLargeError
+    except ValueError:
+        pass
+
+    total = 0
+    while chunk := source.read(1024 * 1024):
+        total += len(chunk)
+        if total > max_bytes:
+            raise TooLargeError
+        target.write(chunk)
+
+
+def _ig_fetch(
+    ydl: yt_dlp.YoutubeDL,
+    url: str,
+    dest: Path,
+    headers: dict | None = None,
+    max_bytes: int = MAX_FILE_SIZE,
+) -> Path:
+    """Качает файл через yt-dlp: так работают те же cookies и прокси, что и у видео."""
+    try:
+        with ydl.urlopen(yt_dlp.networking.Request(url, headers=headers or {})) as resp:
+            ext = {
+                "image/jpeg": ".jpg", "image/webp": ".webp", "image/png": ".png", "image/heic": ".heic",
+                "video/mp4": ".mp4", "audio/mp4": ".m4a", "audio/mpeg": ".mp3",
+            }.get((resp.headers.get("Content-Type") or "").split(";")[0].strip(), "")
+            dest = dest.with_suffix(ext) if ext else dest
+            with dest.open("wb") as f:
+                _copy_limited(resp, f, max_bytes)
+    except yt_dlp.networking.exceptions.HTTPError as exc:
+        # текст «HTTP Error 429: …» подхватят те же разборщики ошибок, что и у yt-dlp
+        raise yt_dlp.utils.DownloadError(f"Instagram: {exc}") from exc
+    except yt_dlp.networking.exceptions.RequestError as exc:
+        raise yt_dlp.utils.DownloadError(f"Instagram: {exc}") from exc
+    return dest
+
+
+def _ig_post(ydl: yt_dlp.YoutubeDL, url: str, workdir: Path) -> dict:
+    pk = _ig_media_pk(url)
+    if pk is None:
+        raise yt_dlp.utils.DownloadError("There is no video in this post")
+    raw = _ig_fetch(
+        ydl,
+        f"https://i.instagram.com/api/v1/media/{pk}/info/",
+        workdir / "post.json",
+        IG_API_HEADERS,
+        MAX_METADATA_SIZE,
+    )
+    items = json.loads(raw.read_text(encoding="utf-8")).get("items") or []
+    if not items:
+        raise yt_dlp.utils.DownloadError("There is no video in this post")
+    return items[0]
+
+
+def _ig_music(item: dict) -> dict | None:
+    """Музыка поста: откуда качать и какой кусок трека звучит в Instagram."""
+    metadata = item.get("music_metadata") or {}
+    info = metadata.get("music_info") or {}
+    asset = info.get("music_asset_info") or {}
+    consumption = info.get("music_consumption_info") or {}
+    url = asset.get("progressive_download_url") or asset.get("fast_start_progressive_download_url")
+    if url:
+        return {
+            "url": url,
+            "start": (consumption.get("audio_asset_start_time_in_ms") or 0) / 1000,
+            "length": (consumption.get("overlap_duration_in_ms") or 0) / 1000,
+            "title": asset.get("title") or "",
+            "artist": asset.get("display_artist") or "",
+        }
+    # не трек из библиотеки, а «оригинальный звук» автора: у него своё поле и нет выбранного фрагмента
+    sound = metadata.get("original_sound_info") or {}
+    url = sound.get("progressive_download_url")
+    if url:
+        return {
+            "url": url,
+            "start": 0,
+            "length": (sound.get("duration_in_ms") or 0) / 1000,
+            "title": sound.get("original_audio_title") or "Оригинальный звук",
+            "artist": (sound.get("ig_artist") or {}).get("username") or "",
+        }
+    return None
+
+
+def _biggest(versions: list[dict]) -> str | None:
+    best = max(versions or [{}], key=lambda v: (v.get("width") or 0) * (v.get("height") or 0))
+    return best.get("url")
+
+
+def _ig_title(item: dict, music: dict | None) -> str:
+    author = (item.get("user") or {}).get("username")
+    if not music:
+        return f"Фото @{author}" if author else "Фото"
+    track = " — ".join(part for part in (music["artist"], music["title"]) if part)
+    return " · ".join(part for part in (f"Фото @{author}" if author else "Фото", f"🎵 {track}" if track else "") if part)
+
+
+def _ig_music_only(url: str, workdir: Path, on_progress=None) -> tuple[Path, dict]:
+    """«Только звук» для поста с фото: отдаём тот кусок трека, что звучит в посте."""
+    workdir.mkdir(parents=True, exist_ok=True)
+    with yt_dlp.YoutubeDL(_base_opts("ig")) as ydl:
+        item = _ig_post(ydl, url, workdir)
+        music = _ig_music(item)
+        if not music:
+            raise yt_dlp.utils.DownloadError("There is no video in this post")
+        track = _ig_fetch(ydl, music["url"], workdir / "music")
+    out = workdir / "music.mp3"
+    length = music["length"] or SLIDESHOW_MAX_SEC
+    _run_ffmpeg(
+        ["-ss", str(music["start"]), "-i", str(track), "-t", str(length), "-vn",
+         "-c:a", "libmp3lame", "-b:a", "192k",
+         "-metadata", f"title={music['title']}", "-metadata", f"artist={music['artist']}", str(out)],
+        on_progress, "slideshow",
+    )
+    return out, {
+        "title": _ig_title(item, music), "track": music["title"], "artist": music["artist"],
+        "duration": length,
+    }
+
+
+def build_ig_slideshow(url: str, workdir: Path, on_progress=None) -> tuple[Path, dict]:
+    """Пост из фото (одно фото или карусель): с музыкой → видео, как его показывает Instagram,
+    без музыки → сами фото, info["album"] = [(вид, путь), …].
+
+    yt-dlp такие посты не качает: видео в них нет. Берём слайды и трек из API,
+    каждый слайд кодируем в одинаковый отрезок, склеиваем и накладываем музыку.
+    """
+    workdir.mkdir(parents=True, exist_ok=True)
+    with yt_dlp.YoutubeDL(_base_opts("ig")) as ydl:
+        item = _ig_post(ydl, url, workdir)
+        music = _ig_music(item)
+        slides = item.get("carousel_media") or [item]
+        files = []
+        for n, slide in enumerate(slides):
+            if on_progress:
+                on_progress({"status": "slideshow" if music else "photos"})
+            if slide.get("media_type") == 2 and slide.get("video_versions"):
+                files.append(("video", _ig_fetch(ydl, _biggest(slide["video_versions"]), workdir / f"s{n:02d}")))
+            elif (slide.get("image_versions2") or {}).get("candidates"):
+                files.append(("photo", _ig_fetch(ydl, _biggest(slide["image_versions2"]["candidates"]), workdir / f"s{n:02d}")))
+        if not files:
+            raise yt_dlp.utils.DownloadError("There is no video in this post")
+        if not music:
+            return workdir, {"title": _ig_title(item, None), "album": _telegram_photos(files, on_progress)}
+        track = _ig_fetch(ydl, music["url"], workdir / "music")
+
+    # кадр по пропорциям первого слайда: в карусели Instagram они у всех одинаковые
+    first = slides[0]
+    src_w = first.get("original_width") or item.get("original_width") or 1080
+    src_h = first.get("original_height") or item.get("original_height") or 1350
+    width = SLIDESHOW_SIDE
+    height = max(2, round(width * src_h / src_w / 2) * 2)
+    photos = sum(1 for kind, _ in files if kind == "photo")
+    photo_sec = SLIDE_SEC
+    if photos == len(files) and music["length"]:
+        # одно фото показываем весь фрагмент, несколько — делим его между ними
+        photo_sec = music["length"] / photos if photos == 1 else min(SLIDE_MAX_SEC, max(SLIDE_SEC, music["length"] / photos))
+    photo_sec = min(photo_sec, SLIDESHOW_MAX_SEC)
+    canvas = (
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p,fps={SLIDESHOW_FPS}"
+    )
+    encode = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-an"]
+    segments = []
+    total = 0.0
+    for n, (kind, path) in enumerate(files):
+        if total >= SLIDESHOW_MAX_SEC:
+            break
+        segment = workdir / f"seg{n:02d}.mp4"
+        if kind == "photo":
+            # фото декодируем один раз и повторяем кадр: -loop 1 декодировал бы его на каждом
+            args = ["-i", str(path), "-vf", f"{canvas},tpad=stop_mode=clone:stop_duration={photo_sec}",
+                    "-tune", "stillimage", "-t", str(photo_sec)]
+            total += photo_sec
+        else:
+            length = min(SLIDESHOW_MAX_SEC - total, 60)
+            args = ["-i", str(path), "-vf", canvas, "-t", str(length)]
+            total += min(length, float(_probe_duration(path) or length))
+        _run_ffmpeg([*args, *encode, str(segment)], on_progress, "slideshow")
+        segments.append(segment)
+
+    playlist = workdir / "segments.txt"
+    playlist.write_text("".join(f"file '{s.name}'\n" for s in segments), encoding="utf-8")
+    out = workdir / "slideshow.mp4"
+    _run_ffmpeg(
+        ["-f", "concat", "-safe", "0", "-i", str(playlist),
+         # трек короче слайд-шоу — пускаем по кругу, длиннее — обрезаем по видео
+         "-stream_loop", "-1", "-ss", str(music["start"]), "-i", str(track),
+         "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "160k",
+         "-shortest", "-movflags", "+faststart", str(out)],
+        on_progress, "slideshow",
+    )
+    log.info("слайд-шоу: %d слайдов, %s, %dx%d", len(segments), fmt_time(total), width, height)
+    return out, {
+        "title": _ig_title(item, music), "width": width, "height": height, "duration": total,
+    }
+
+
+def _telegram_photos(files: list[tuple[str, Path]], on_progress=None) -> list[tuple[str, Path]]:
+    """Telegram принимает фото в JPEG/PNG; webp и heic из Instagram переводим в JPEG."""
+    result = []
+    for kind, path in files:
+        if kind == "photo" and path.suffix.lower() not in (".jpg", ".jpeg", ".png"):
+            jpeg = path.with_suffix(".jpg")
+            _run_ffmpeg(["-i", str(path), "-frames:v", "1", "-q:v", "2", str(jpeg)], on_progress, "photos")
+            path = jpeg
+        result.append((kind, path))
+    return result
+
+
+def _probe_duration(path: Path) -> float | None:
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True, timeout=60,
+    )
+    try:
+        return float(probe.stdout.strip())
+    except ValueError:
+        return None
+
+
 def _with_cookie_retry(fn, url: str, workdir: Path, on_progress) -> tuple[Path, dict]:
-    """Первая попытка анонимная; если сервис потребовал вход — повторяем с cookies."""
+    """Первая попытка анонимная; если сервис отказал без входа — повторяем с cookies."""
     service = service_of(url_key(url))
     try:
         return fn(url, workdir, on_progress, False)
     except yt_dlp.utils.DownloadError as exc:
         if has_cookie_fallback(service) and is_auth_error(exc):
             log.info(
-                "[%s] требует вход (%s…) — повторяю с cookies",
-                service, ANSI_RE.sub("", str(exc))[:70],
+                "[%s] отказ анонимному запросу (%s…) — повторяю с cookies",
+                service, safe_error(exc, 70),
             )
             return fn(url, workdir, on_progress, True)
         raise
 
 
+def _with_photo_fallback(fn, fallback, url: str, workdir: Path, on_progress) -> tuple[Path, dict]:
+    """yt-dlp не нашёл видео в посте Instagram — возможно, это фото с музыкой."""
+    try:
+        return _with_cookie_retry(fn, url, workdir, on_progress)
+    except yt_dlp.utils.DownloadError as exc:
+        # музыку API Instagram отдаёт только залогиненным — без cookies и пробовать нечего
+        if service_of(url_key(url)) != "ig" or not is_no_video_error(exc) or not use_cookies_for("ig"):
+            raise
+        log.info("[%s] видео в посте нет — пробую фото с музыкой", url_key(url))
+        try:
+            return fallback(url, workdir, on_progress)
+        except yt_dlp.utils.DownloadError as fallback_exc:
+            if is_no_video_error(fallback_exc):
+                raise exc from None  # музыки нет — отвечаем исходной ошибкой «только фото»
+            raise
+
+
 def download_video(url: str, workdir: Path, on_progress=None) -> tuple[Path, dict]:
-    return _with_cookie_retry(_download_video, url, workdir, on_progress)
+    return _with_photo_fallback(_download_video, build_ig_slideshow, url, workdir, on_progress)
 
 
 def download_audio(url: str, workdir: Path, on_progress=None) -> tuple[Path, dict]:
-    return _with_cookie_retry(_download_audio, url, workdir, on_progress)
+    return _with_photo_fallback(_download_audio, _ig_music_only, url, workdir, on_progress)
 
 
 def _download_audio(url: str, workdir: Path, on_progress, with_cookies: bool) -> tuple[Path, dict]:
@@ -529,13 +1190,14 @@ def _download_video(url: str, workdir: Path, on_progress, with_cookies: bool) ->
     with yt_dlp.YoutubeDL(_base_opts(service, with_cookies)) as ydl:
         probe = _pick_entry(ydl.extract_info(url, download=False))
     start_height = choose_start_height(probe)
+    side = short_side(probe)
     ladder = tuple(h for h in HEIGHT_LADDER if h <= start_height) or (HEIGHT_LADDER[-1],)
     for height in ladder:
         attempt_dir = workdir / f"h{height}"
         attempt_dir.mkdir(parents=True, exist_ok=True)
         try:
             with yt_dlp.YoutubeDL(
-                _ydl_opts(attempt_dir, height, on_progress, service, with_cookies)
+                _ydl_opts(attempt_dir, height, on_progress, service, with_cookies, side)
             ) as ydl:
                 info = _pick_entry(ydl.extract_info(url, download=True))
         except yt_dlp.utils.DownloadError as exc:
@@ -546,6 +1208,8 @@ def _download_video(url: str, workdir: Path, on_progress, with_cookies: bool) ->
         if path is None:
             # yt-dlp прервал скачивание (файл превысил лимит) — пробуем качество ниже
             continue
+        # после перекодирования файл может потяжелеть — тогда тоже качество ниже
+        path = make_ios_compatible(path, info, on_progress)
         if path.stat().st_size <= MAX_FILE_SIZE:
             return path, info
         path.unlink(missing_ok=True)
@@ -578,9 +1242,20 @@ def friendly_dlp_error(exc: yt_dlp.utils.DownloadError, service: str = "") -> st
             f"Подожду {RATE_LIMIT_COOLDOWN_MIN} минут и снова буду принимать ссылки — "
             f"повторять сейчас бесполезно, от этого блокировка только продлевается."
         )
-    if "no video formats found" in low:
-        return "🖼 В этом посте нет видео — только фото. Скачивать нечего."
+    if is_no_video_error(exc):
+        if service == "ig" and not use_cookies_for("ig"):
+            # без аккаунта музыку поста не проверить, так что «музыки нет» было бы враньём
+            return (
+                "🖼 В этом посте нет видео, только фото. Если там есть музыка, собрать из неё "
+                "видео можно только через аккаунт Instagram, а у бота он сейчас отключён."
+            )
+        return "🖼 В этом посте только фото, без видео и музыки. Скачивать нечего."
     if "400" in low and "bad request" in low:
+        if ig_session_state == "checkpoint":
+            return (
+                "🔐 Instagram заблокировал вход в аккаунт бота до подтверждения «Это были вы?». "
+                "Владелец уже в курсе — как подтвердит, рилсы снова начнут качаться."
+            )
         return (
             "🔑 Instagram разлогинил бота: сессия в cookies больше не действует.\n"
             "Нужно заново выгрузить cookies.txt из браузера — до этого рилсы качаться не будут."
@@ -591,6 +1266,11 @@ def friendly_dlp_error(exc: yt_dlp.utils.DownloadError, service: str = "") -> st
             "из закрытого или возрастного аккаунта. Нужны cookies (см. README)."
         )
     if "403" in low and "forbidden" in low:
+        if service == "yt" and (has_cookie_fallback("yt") or use_cookies_for("yt")):
+            return (
+                "🚧 YouTube отклонил скачивание (HTTP 403) даже с cookies аккаунта. "
+                "Возможно, сессия протухла — попробуй позже или выгрузи cookies заново."
+            )
         return (
             f"🚧 Сервер {DOWNLOAD_ATTEMPTS} раза подряд отклонил скачивание (HTTP 403) — "
             "похоже, наш IP временно придерживают. Подожди минут десять и пришли ссылку ещё раз."
@@ -626,7 +1306,7 @@ def friendly_dlp_error(exc: yt_dlp.utils.DownloadError, service: str = "") -> st
         return "🔒 Это приватное видео — без cookies аккаунта, у которого есть доступ, не скачать."
     if "unsupported url" in low:
         return "🤷 Не смог распознать эту ссылку. Проверь, что она ведёт на конкретное видео."
-    return f"💥 Не получилось скачать:\n<code>{html.escape(text[:300])}</code>"
+    return "💥 Не получилось скачать это видео. Подробности сохранены в логах бота."
 
 
 @router.message(CommandStart())
@@ -665,12 +1345,9 @@ async def handle_link(message: Message) -> None:
             await message.reply("Пришли ссылку на видео из YouTube, Instagram, TikTok или X.")
         return
     url = match.group(0)
-    if not ALLOW_ANY_SITE and not is_supported(url):
+    if not is_supported(url):
         if is_private:
-            await message.reply(
-                "Я скачиваю только из YouTube, Instagram, TikTok и X.\n"
-                "Хочешь другие сайты — включи ALLOW_ANY_SITE=true в .env."
-            )
+            await message.reply("Я принимаю только HTTPS-ссылки из YouTube, Instagram, TikTok и X.")
         return
     if not allowed:
         await message.reply(
@@ -681,19 +1358,39 @@ async def handle_link(message: Message) -> None:
 
     key = url_key(url)
     who = describe_sender(message)
-    log.info("запрос: %s → %s [%s]", who, url, key)
-    try:
-        status = await message.reply("🔍 Смотрю, что за видео…")
-    except (TelegramBadRequest, TelegramForbiddenError) as exc:
-        # бота ограничили в чате — молча пропускаем, иначе каждая ссылка сыпет трейсбеки
-        log.warning("не могу писать в чате %s (%s) — пропускаю ссылку", message.chat.id, exc.message)
+    log.info("запрос: %s → %s [%s]", who, safe_url_for_log(url), key)
+    requester_id = requester_id_of(message)
+    queue_error = await reserve_request(requester_id)
+    if queue_error:
+        text = (
+            "⏳ Сейчас очередь заполнена. Попробуй немного позже."
+            if queue_error == "global"
+            else "⏳ У тебя уже слишком много запросов в очереди. Дождись их завершения."
+        )
+        try:
+            await message.reply(text)
+        except (TelegramBadRequest, TelegramForbiddenError):
+            pass
         return
-    lock = url_locks.setdefault(key, asyncio.Lock())
-    if lock.locked() and key not in file_ids:
-        log.info("[%s] уже качается, %s ждёт результат", key, who)
-        await status.edit_text("⏳ Это видео уже качается — дождусь и пришлю сюда тоже.")
-    async with lock:
-        await deliver(message, status, url, key, who, "video")
+
+    try:
+        try:
+            status = await message.reply("🔍 Смотрю, что за видео…")
+        except (TelegramBadRequest, TelegramForbiddenError) as exc:
+            # бота ограничили в чате — молча пропускаем, иначе каждая ссылка сыпет трейсбеки
+            log.warning("не могу писать в чате %s (%s) — пропускаю ссылку", message.chat.id, exc.message)
+            return
+        lock_entry = retain_url_lock(key)
+        try:
+            if lock_entry.lock.locked() and key not in file_ids:
+                log.info("[%s] уже качается, %s ждёт результат", key, who)
+                await status.edit_text("⏳ Это видео уже качается — дождусь и пришлю сюда тоже.")
+            async with lock_entry.lock:
+                await deliver(message, status, url, key, who, "video")
+        finally:
+            release_url_lock(key, lock_entry)
+    finally:
+        await release_request(requester_id)
 
 
 async def show_error(status: Message, text: str) -> None:
@@ -733,14 +1430,49 @@ async def deliver(
     await download_and_send(message, status, url, key, who, kind)
 
 
+ALBUM_SIZE = 10  # больше Telegram в один альбом не кладёт
+
+
+async def send_album(message: Message, items: list, caption: str | None) -> list[list[str]]:
+    """Шлёт фото и видео альбомами; items — [(вид, файл или file_id), …]. Возвращает file_id для кеша."""
+    sent_ids = []
+    for start in range(0, len(items), ALBUM_SIZE):
+        chunk = items[start:start + ALBUM_SIZE]
+        chunk_caption = caption if start == 0 else None
+        if len(chunk) == 1:  # альбом из одного элемента Telegram не принимает
+            kind, media = chunk[0]
+            if kind == "photo":
+                send = message.reply_photo(media, caption=chunk_caption)
+            else:
+                send = message.reply_video(media, caption=chunk_caption, supports_streaming=True)
+            messages = [await message.bot(send, request_timeout=UPLOAD_TIMEOUT)]
+        else:
+            group = [
+                InputMediaPhoto(media=media, caption=chunk_caption if n == 0 else None)
+                if kind == "photo"
+                else InputMediaVideo(media=media, caption=chunk_caption if n == 0 else None, supports_streaming=True)
+                for n, (kind, media) in enumerate(chunk)
+            ]
+            messages = await message.bot(message.reply_media_group(group), request_timeout=UPLOAD_TIMEOUT)
+        for sent in messages:
+            if sent.photo:
+                sent_ids.append(["photo", sent.photo[-1].file_id])  # последний размер — самый большой
+            elif sent.video:
+                sent_ids.append(["video", sent.video.file_id])
+    return sent_ids
+
+
 async def send_cached(message: Message, status: Message, key: str, kind: str) -> bool:
     """Уже отправляли — Telegram перешлёт файл по file_id мгновенно."""
     entry = cache_get(key, kind)
     if not entry:
         return False
-    caption = entry.get("title") or None
+    # в кеше название сырое; без экранирования «Tom & Jerry» роняет отправку в режиме HTML
+    caption = html.escape(entry.get("title") or "") or None
     try:
-        if kind == "audio":
+        if entry.get("album"):
+            await send_album(message, [tuple(item) for item in entry["album"]], caption)
+        elif kind == "audio":
             await message.reply_audio(entry["file_id"], caption=caption)
         else:
             await message.reply_video(
@@ -758,7 +1490,7 @@ async def send_cached(message: Message, status: Message, key: str, kind: str) ->
 async def download_and_send(
     message: Message, status: Message, url: str, key: str, who: str, kind: str
 ) -> None:
-    requester_id = message.from_user.id if message.from_user else 0
+    requester_id = requester_id_of(message)
     job = Job(requester_id, kind)
     reporter = ProgressReporter(asyncio.get_running_loop(), status, job)
     grab = download_audio if kind == "audio" else download_video
@@ -785,7 +1517,7 @@ async def download_and_send(
                 delay = RETRY_DELAYS[attempt - 1]
                 log.warning(
                     "попытка %d/%d не удалась (%s), повтор через %d c: %s",
-                    attempt, DOWNLOAD_ATTEMPTS, url, delay, exc,
+                    attempt, DOWNLOAD_ATTEMPTS, safe_url_for_log(url), delay, safe_error(exc),
                 )
                 await status.edit_text(
                     f"🚧 Сервер отбил скачивание, повторю через {delay} сек… "
@@ -793,8 +1525,25 @@ async def download_and_send(
                 )
                 await asyncio.sleep(delay)
         job.check()
-        size = path.stat().st_size
         title = (info.get("title") or ("Аудио" if kind == "audio" else "Видео"))[:900]
+        if info.get("album"):  # пост из одних фото, без музыки
+            album = info["album"]
+            await status.edit_text(f"📤 Отправляю в Telegram… ({len(album)} шт.)")
+            await message.bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_PHOTO)
+            sent_ids = await send_album(
+                message, [(item_kind, FSInputFile(item)) for item_kind, item in album], html.escape(title)
+            )
+            if sent_ids:
+                cache_put_album(key, kind, sent_ids, title)
+            if service_of(key) == "ig":
+                await set_ig_state(message.bot, "ok")
+            log.info(
+                "[%s/%s] готово за %s: альбом из %d, для %s",
+                key, kind, fmt_time(time.monotonic() - started), len(album), who,
+            )
+            await status.delete()
+            return
+        size = path.stat().st_size
         await status.edit_text(f"📤 Отправляю в Telegram… ({fmt_size(size)})")
         await message.bot.send_chat_action(
             message.chat.id,
@@ -823,6 +1572,8 @@ async def download_and_send(
         media = sent.audio if kind == "audio" else sent.video
         if media:  # запомним, чтобы второй раз не качать
             cache_put(key, kind, media.file_id, title)
+        if service_of(key) == "ig":  # с проверкой входа Instagram не отдал бы ничего
+            await set_ig_state(message.bot, "ok")
         log.info(
             "[%s/%s] готово за %s: %s, %s, для %s",
             key, kind, fmt_time(time.monotonic() - started), fmt_size(size),
@@ -850,6 +1601,8 @@ async def download_and_send(
         )
         await show_error(status, f"{limit_note}\n{hint}")
     except asyncio.TimeoutError:
+        # wait_for бросил ждать, но поток yt-dlp ещё качает — остановится на ближайшем хуке
+        job.cancelled = True
         await show_error(status, "⌛ Скачивание не уложилось в таймаут. Попробуй ещё раз или видео покороче.")
     except yt_dlp.utils.DownloadError as exc:
         service = service_of(key)
@@ -860,18 +1613,26 @@ async def download_and_send(
                 key, SERVICE_NAMES.get(service, service), RATE_LIMIT_COOLDOWN_MIN,
             )
         else:
-            log.warning("yt-dlp error for %s: %s", url, exc)
+            log.warning("yt-dlp error for %s: %s", safe_url_for_log(url), safe_error(exc))
+        if service == "ig":  # отказ Instagram — частый признак, что сессию стёрли или заблокировали
+            low = str(exc).lower()
+            await check_ig_session(message.bot, url if "400" in low and "bad request" in low else None)
         await show_error(status, friendly_dlp_error(exc, service))
     except TelegramNetworkError as exc:
-        log.warning("upload failed for %s: %s", url, exc)
+        log.warning("upload failed for %s: %s", safe_url_for_log(url), safe_error(exc))
         await show_error(
             status,
             "📶 Скачал, но не смог загрузить файл в Telegram — оборвалась сеть или "
             "не хватило таймаута на отправку. Попробуй ещё раз; если повторяется, "
             "увеличь UPLOAD_TIMEOUT в .env.",
         )
-    except Exception:
-        log.exception("Не смог обработать %s", url)
+    except Exception as exc:
+        # Не печатаем traceback: сообщения исключений внешних библиотек могут содержать
+        # подписанные URL. Тип и очищенный текст оставляют достаточно данных для диагностики.
+        log.error(
+            "Не смог обработать [%s] (%s): %s",
+            key, type(exc).__name__, safe_error(exc),
+        )
         await show_error(status, "💥 Что-то пошло не так. Подробности в логах бота.")
     finally:
         job.close()
@@ -906,10 +1667,54 @@ async def cb_audio(query: CallbackQuery) -> None:
     await query.answer("Переключаюсь на звук…")
 
 
-async def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+def validate_security_config() -> None:
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN не задан: скопируй .env.example в .env и впиши токен от @BotFather.")
+    if not ALLOWED_USER_IDS and not ALLOWED_CHAT_IDS:
+        raise SystemExit(
+            "Доступ закрыт по умолчанию: задай ALLOWED_USER_IDS и/или ALLOWED_CHAT_IDS в .env."
+        )
+
+    positive_limits = {
+        "MAX_CONCURRENT_DOWNLOADS": MAX_CONCURRENT_DOWNLOADS,
+        "MAX_PENDING_REQUESTS": MAX_PENDING_REQUESTS,
+        "MAX_REQUESTS_PER_USER": MAX_REQUESTS_PER_USER,
+        "MAX_CACHE_ENTRIES": MAX_CACHE_ENTRIES,
+        "MAX_FILE_SIZE_MB": MAX_FILE_SIZE_MB,
+    }
+    invalid = [name for name, value in positive_limits.items() if value < 1]
+    if invalid:
+        raise SystemExit(f"Настройки должны быть больше нуля: {', '.join(invalid)}")
+
+    if TELEGRAM_API_URL:
+        api = urlparse(TELEGRAM_API_URL)
+        if (
+            api.scheme not in {"http", "https"}
+            or api.hostname not in {"127.0.0.1", "::1", "localhost"}
+            or api.username
+            or api.password
+        ):
+            raise SystemExit(
+                "TELEGRAM_API_URL может указывать только на локальный адрес "
+                "127.0.0.1, ::1 или localhost без логина и пароля."
+            )
+
+    if COOKIES_FILE:
+        cookie_path = Path(COOKIES_FILE)
+        if not cookie_path.is_file():
+            raise SystemExit("COOKIES_FILE задан, но файл не найден.")
+        if os.name != "nt" and cookie_path.stat().st_mode & 0o077:
+            log.warning("cookies доступны другим пользователям ОС; установи права 600")
+        if ALLOWED_CHAT_IDS:
+            log.warning(
+                "cookies включены вместе с групповыми чатами: каждый участник разрешённого "
+                "чата получает возможности аккаунта из cookies"
+            )
+
+
+async def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    validate_security_config()
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     load_cache()
     session = None
@@ -925,7 +1730,11 @@ async def main() -> None:
         "Бот @%s запущен: API=%s, лимит файла %d МБ, качество до %dp",
         me.username, TELEGRAM_API_URL or "api.telegram.org", MAX_FILE_SIZE_MB, MAX_HEIGHT,
     )
-    await dp.start_polling(bot)
+    session_watcher = asyncio.create_task(watch_ig_session(bot))  # ссылка держит задачу от GC
+    try:
+        await dp.start_polling(bot)
+    finally:
+        session_watcher.cancel()
 
 
 if __name__ == "__main__":
