@@ -11,7 +11,10 @@ def message(user_id: int, chat_id: int):
     return SimpleNamespace(
         from_user=SimpleNamespace(id=user_id),
         sender_chat=None,
-        chat=SimpleNamespace(id=chat_id),
+        # доступ в личке и в группе решается по-разному, поэтому нужен тип чата
+        chat=SimpleNamespace(
+            id=chat_id, type=bot.ChatType.SUPERGROUP if chat_id < 0 else bot.ChatType.PRIVATE
+        ),
     )
 
 

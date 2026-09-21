@@ -160,3 +160,43 @@ class InstagramFallbackTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LoggedOutSessionTests(unittest.TestCase):
+    """Instagram может завершить сессию, оставив sessionid в файле: API тогда отвечает гостевым 404."""
+
+    # то же окружение с cookies, но без повторного прогона всех тестов InstagramFallbackTests
+    setUp = InstagramFallbackTests.setUp
+    write_session = InstagramFallbackTests.write_session
+
+    def test_logged_out_api_page_disables_session_instead_of_404(self):
+        photo_url = "https://www.instagram.com/p/DcYnX0LqASx/"
+
+        def grab(url, workdir, hook, with_cookies):
+            raise bot.yt_dlp.utils.DownloadError("ERROR: [Instagram] x: There is no video in this post")
+
+        def fallback(url, workdir, hook):
+            raise bot.yt_dlp.utils.DownloadError(f"Instagram: {bot.IG_LOGGED_OUT_MARKER}")
+
+        with self.assertRaises(bot.InstagramSessionUnavailable) as caught:
+            bot._with_photo_fallback(grab, fallback, photo_url, self.root, None)
+        self.assertFalse(bot.ig_auth_available())
+        text = bot.friendly_dlp_error(caught.exception, "ig")
+        self.assertNotIn("404", text)
+        self.assertIn("сессия Instagram", text)
+
+
+class ErrorTextTests(unittest.TestCase):
+    def test_truncated_cdn_response_is_retried(self):
+        exc = bot.yt_dlp.utils.DownloadError(
+            "ERROR: [download] Got error: 4922 bytes read, 10058599 more expected. Giving up after 3 retries"
+        )
+        self.assertTrue(bot.is_transient_dlp_error(exc))
+
+    def test_tiktok_challenge_and_future_live_have_clear_messages(self):
+        tiktok = bot.yt_dlp.utils.DownloadError(
+            "ERROR: [TikTok] 1: Unexpected response from webpage request; please report this issue"
+        )
+        self.assertIn("TikTok", bot.friendly_dlp_error(tiktok, "tt"))
+        live = bot.yt_dlp.utils.DownloadError("ERROR: [youtube] x: This live event will begin in 63 minutes.")
+        self.assertIn("ещё не началась", bot.friendly_dlp_error(live, "yt"))

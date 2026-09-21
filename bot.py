@@ -17,6 +17,7 @@ import struct
 import subprocess
 import tempfile
 import threading
+import traceback
 import time
 import uuid
 from pathlib import Path
@@ -29,9 +30,10 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 from aiogram.enums import ChatAction, ChatType, ParseMode
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import JOIN_TRANSITION, ChatMemberUpdatedFilter, Command, CommandStart
 from aiogram.types import (
     CallbackQuery,
+    ChatMemberUpdated,
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -303,10 +305,66 @@ class TooLargeError(Exception):
     """Видео не влезает в лимит Telegram даже в минимальном качестве."""
 
 
+# Доступ по одобрению автора. ALLOWED_USER_IDS — владельцы: им можно всё и они решают.
+# Решения по группам и людям хранятся в access.json; ALLOWED_CHAT_IDS из .env — стартовые
+# разрешения для групп, у которых ещё нет записи (их тоже можно отозвать через /access).
+OWNER_USERNAME = os.getenv("OWNER_USERNAME", "AlexShep").strip().lstrip("@")
+ACCESS_FILE = CACHE_FILE.with_name("access.json")
+ACCESS_REMIND_SEC = 600  # в ожидающей группе напоминаем о запросе не чаще раза в 10 минут
+access: dict[str, dict[str, dict]] = {"chats": {}, "users": {}}
+access_reminded: dict[int, float] = {}
+
+
+def load_access() -> None:
+    try:
+        data = json.loads(ACCESS_FILE.read_text(encoding="utf-8"))
+        for kind in access:
+            access[kind].update(data.get(kind) or {})
+        log.info("доступ: %d групп, %d человек в списке", len(access["chats"]), len(access["users"]))
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as exc:
+        log.warning("не смог прочитать %s: %s", ACCESS_FILE, safe_error(exc))
+
+
+def save_access() -> None:
+    temp = ACCESS_FILE.with_suffix(".tmp")
+    try:
+        temp.write_text(json.dumps(access, ensure_ascii=False, indent=1), encoding="utf-8")
+        os.replace(temp, ACCESS_FILE)
+    except OSError as exc:
+        log.error("не смог сохранить решения о доступе: %s", safe_error(exc))
+
+
+def access_status(kind: str, target_id: int) -> str | None:
+    """allowed | denied | pending | None (ещё не просили)."""
+    record = access[kind].get(str(target_id))
+    if record:
+        return record.get("status")
+    if kind == "chats" and target_id in ALLOWED_CHAT_IDS:
+        return "allowed"
+    return None
+
+
+def set_access(kind: str, target_id: int, status: str, title: str | None = None) -> bool:
+    """Записывает решение; True, если статус поменялся."""
+    previous = access_status(kind, target_id)
+    record = access[kind].setdefault(str(target_id), {"title": title or str(target_id)})
+    if title:
+        record["title"] = title
+    changed = previous != status
+    record["status"] = status
+    record["updated"] = int(time.time())
+    save_access()
+    return changed
+
+
 def is_allowed(message: Message) -> bool:
     if message.from_user and message.from_user.id in ALLOWED_USER_IDS:
         return True
-    return message.chat.id in ALLOWED_CHAT_IDS
+    if message.chat.type == ChatType.PRIVATE:
+        return access_status("users", message.chat.id) == "allowed"
+    return access_status("chats", message.chat.id) == "allowed"
 
 
 def requester_id_of(message: Message) -> int:
@@ -504,7 +562,8 @@ def run_ig_authenticated(fn, url: str):
             checkpoint = "checkpoint_required" in low or "challenge_required" in low
             if not checkpoint and "400" in low and "bad request" in low:
                 checkpoint = ig_checkpoint(url)
-            if checkpoint:
+            # сессию завершили на стороне Instagram: дальше с ней пробовать бессмысленно
+            if checkpoint or IG_LOGGED_OUT_MARKER in low:
                 block_ig_session(fingerprint)
                 raise InstagramSessionUnavailable("Instagram session disabled after checkpoint") from None
             raise
@@ -549,18 +608,19 @@ def ig_state_message(state: str) -> str:
             f"Выгрузи cookies instagram.com заново и положи на сервер в <code>{html.escape(COOKIES_FILE)}</code>."
         ),
         "checkpoint": (
-            "🔐 Instagram заблокировал вход в аккаунт бота и ждёт подтверждения «Это были вы?» "
-            "(checkpoint_required). Бот отключил эту сессию и продолжает работать анонимно и из кеша.\n"
+            "🔐 Instagram больше не пускает бота в аккаунт: вход заблокирован проверкой «Это были вы?» "
+            "или сессия завершена. Бот отключил эту сессию и продолжает работать анонимно и из кеша — "
+            "посты из фото без неё не качаются.\n"
             "Восстанови вход в аккаунт и экспортируй свежие cookies. Подтверждение в приложении "
             "само по себе не гарантирует восстановления серверной сессии."
         ),
     }[state]
 
 
-async def notify_owners(bot: Bot, text: str) -> None:
+async def notify_owners(bot: Bot, text: str, **kwargs) -> None:
     for user_id in ALLOWED_USER_IDS:
         try:
-            await bot.send_message(user_id, text)
+            await bot.send_message(user_id, text, **kwargs)
         except Exception as exc:  # владелец не запускал бота в личке и т.п.
             log.warning("не смог написать владельцу %s: %s", user_id, safe_error(exc))
 
@@ -873,7 +933,8 @@ class ProgressReporter:
             log.debug("не смог обновить статус: %s", exc)
 
 
-IOS_VIDEO_CODECS = {"h264"}
+# HEVC — родной кодек iPhone; TikTok в 720p/1080p отдаёт только его, так что не перекодируем
+IOS_VIDEO_CODECS = {"h264", "hevc"}
 IOS_PIX_FMTS = {"yuv420p", "yuvj420p"}  # 10-битный H.264 (yuv420p10le) iPhone не декодирует
 IOS_AUDIO_CODECS = {"aac", "mp3"}
 
@@ -946,8 +1007,10 @@ def make_ios_compatible(path: Path, info: dict, on_progress=None) -> Path:
         info["duration"] = duration
 
     video_ok = video.get("codec_name") in IOS_VIDEO_CODECS and video.get("pix_fmt") in IOS_PIX_FMTS
+    # HEVC с меткой hev1 плеер Apple не открывает, с hvc1 — да; меняется без перекодирования
+    retag_hevc = video.get("codec_name") == "hevc" and video.get("codec_tag_string") != "hvc1"
     audio_ok = audio is None or audio.get("codec_name") in IOS_AUDIO_CODECS
-    if video_ok and audio_ok and _moov_first(path):
+    if video_ok and audio_ok and not retag_hevc and _moov_first(path):
         return path
     if not video_ok and duration > TRANSCODE_MAX_DURATION_MIN * 60:
         log.info(
@@ -957,7 +1020,7 @@ def make_ios_compatible(path: Path, info: dict, on_progress=None) -> Path:
         return path
 
     if video_ok:
-        video_args = ["-c:v", "copy"]
+        video_args = ["-c:v", "copy", *(["-tag:v", "hvc1"] if retag_hevc else [])]
     else:
         video_args = [
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
@@ -989,6 +1052,7 @@ IG_API_HEADERS = {
 }
 IG_SHORTCODE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 NO_VIDEO_MARKERS = ("no video formats found", "there is no video in this post")
+IG_LOGGED_OUT_MARKER = "session is logged out"
 SLIDE_SEC = 3  # сколько показывать фото в карусели
 SLIDE_MAX_SEC = 6  # фото мало, а музыки много — растягиваем, но не до бесконечности
 SLIDESHOW_FPS = 25
@@ -1050,6 +1114,14 @@ def _ig_fetch(
             with dest.open("wb") as f:
                 _copy_limited(resp, f, max_bytes)
     except yt_dlp.networking.exceptions.HTTPError as exc:
+        try:
+            body = exc.response.read(4000).decode(errors="replace")
+        except Exception:
+            body = ""
+        if "not-logged-in" in body:
+            # API отдаёт страницу «Page Not Found» для гостя: sessionid в файле есть,
+            # но Instagram её больше не принимает — пост ни при чём, 404 тут вводит в заблуждение
+            raise yt_dlp.utils.DownloadError(f"Instagram: {IG_LOGGED_OUT_MARKER}") from exc
         # текст «HTTP Error 429: …» подхватят те же разборщики ошибок, что и у yt-dlp
         raise yt_dlp.utils.DownloadError(f"Instagram: {exc}") from exc
     except yt_dlp.networking.exceptions.RequestError as exc:
@@ -1337,6 +1409,8 @@ def _download_video(url: str, workdir: Path, on_progress, with_cookies: bool) ->
 
 TRANSIENT_ERROR_MARKERS = (
     "403", "forbidden", "timed out", "timeout", "connection reset", "temporary", "http error 5",
+    # «4922 bytes read, 10058599 more expected»: CDN оборвал ответ, повтор обычно проходит
+    "bytes read", "more expected", "incompleteread", "remote end closed connection",
 )
 
 
@@ -1358,6 +1432,13 @@ def friendly_dlp_error(exc: yt_dlp.utils.DownloadError, service: str = "") -> st
             "🔒 Без входа этот материал скачать не удалось, а сессия Instagram сейчас отключена. "
             "Другие публичные ролики и файлы из кеша продолжают работать."
         )
+    if service == "tt" and "unexpected response from webpage request" in low:
+        return (
+            "🎵 TikTok поменял защиту, и загрузчик (yt-dlp) пока не умеет её проходить — "
+            "это общая поломка, исправление ждём от авторов yt-dlp. Попробуй позже."
+        )
+    if "live event will begin" in low or "premieres in" in low:
+        return "📡 Трансляция или премьера ещё не началась — скачивать пока нечего."
     if is_rate_limited(exc):
         name = SERVICE_NAMES.get(service, "Сервис")
         return (
@@ -1428,12 +1509,229 @@ def friendly_dlp_error(exc: yt_dlp.utils.DownloadError, service: str = "") -> st
     return "💥 Не получилось скачать это видео. Подробности сохранены в логах бота."
 
 
+def person(user) -> str:
+    """Кто это — для владельца: имя, @ник, id. Имя задаёт посторонний, поэтому экранируем."""
+    if not user:
+        return "неизвестно"
+    tag = f" @{html.escape(user.username)}" if user.username else ""
+    return f"{html.escape(one_line(user.full_name))}{tag} (id <code>{user.id}</code>)"
+
+
+def sender_of(message: Message) -> str:
+    if message.sender_chat:  # анонимный админ или сообщение от имени канала
+        return f"анонимно от имени «{html.escape(one_line(message.sender_chat.title))}»"
+    return person(message.from_user)
+
+
+def decision_kb(kind: str, target_id: int, status: str, prefix: str = "acc") -> InlineKeyboardMarkup:
+    code = f"{prefix}:{kind[0]}:{target_id}"
+    allow = InlineKeyboardButton(text="✅ Разрешить", callback_data=f"{code}:y")
+    deny = InlineKeyboardButton(
+        text="❌ Отказать" if status == "pending" else "❌ Запретить", callback_data=f"{code}:n"
+    )
+    buttons = {"pending": [allow, deny], "allowed": [deny], "denied": [allow]}[status]
+    return InlineKeyboardMarkup(inline_keyboard=[buttons])
+
+
+async def request_access(bot: Bot, kind: str, target_id: int, title: str, details: str) -> str:
+    """Отправляет владельцу запрос на доступ, если его ещё не было. Возвращает new | pending | denied | allowed."""
+    status = access_status(kind, target_id)
+    if status:
+        return status
+    set_access(kind, target_id, "pending", title)
+    log.info("запрос доступа: %s %s «%s»", kind, target_id, one_line(title))
+    await notify_owners(
+        bot,
+        f"📥 <b>Запрос на доступ к боту</b>\n{details}\n\nИм сказано написать тебе в личку.",
+        reply_markup=decision_kb(kind, target_id, "pending"),
+    )
+    return "new"
+
+
+async def group_details(bot: Bot, chat, who: str, action: str) -> str:
+    lines = [f"Группа: «{html.escape(one_line(chat.title))}»", f"id: <code>{chat.id}</code>"]
+    lines.append(f"Ссылка: @{html.escape(chat.username)}" if chat.username else "Закрытая группа, без публичной ссылки")
+    try:
+        lines.append(f"Участников: {await bot.get_chat_member_count(chat.id)}")
+    except Exception:
+        pass
+    lines.append(f"{action}: {who}")
+    return "\n".join(lines)
+
+
+ACCESS_NOTICES = {
+    ("chats", "allowed"): "✅ Автор разрешил мне работать в этом чате — присылайте ссылки на видео.",
+    ("chats", "denied"): "❌ Автор не разрешил мне работать в этом чате, ссылки обрабатывать не буду.",
+    ("users", "allowed"): "✅ Автор открыл тебе доступ — присылай ссылки на видео.",
+    ("users", "denied"): "❌ Автор не открыл тебе доступ.",
+}
+
+
+async def apply_decision(bot: Bot, kind: str, target_id: int, status: str) -> None:
+    if set_access(kind, target_id, status):
+        log.info("доступ: %s %s → %s", kind, target_id, status)
+        try:
+            await bot.send_message(target_id, ACCESS_NOTICES[kind, status])
+        except Exception as exc:  # бота удалили из группы или человек его заблокировал
+            log.info("не смог сообщить решение в %s: %s", target_id, safe_error(exc))
+
+
+async def ask_stranger(message: Message) -> None:
+    """Незнакомец в личке: просим разрешение у автора и объясняем, что происходит."""
+    status = await request_access(
+        message.bot, "users", message.chat.id, one_line(message.from_user.full_name if message.from_user else ""),
+        f"Личные сообщения\nПользователь: {person(message.from_user)}",
+    )
+    text = {
+        "new": (
+            f"🔒 Скачивать я могу только с разрешения автора. Напиши ему в личку — "
+            f"@{OWNER_USERNAME} — и попроси доступ. Как только он разрешит, я сообщу сюда."
+        ),
+        "pending": (
+            f"⏳ Доступа пока нет. Если ещё не написал автору — напиши @{OWNER_USERNAME} "
+            "и попроси доступ."
+        ),
+        "denied": f"⛔ Автор не открыл доступ. По вопросам — @{OWNER_USERNAME}.",
+    }.get(status)
+    if text:
+        await message.reply(text)
+
+
+async def ask_for_group(message: Message) -> None:
+    """Ссылка в группе, которой ещё не разрешили: запрос автору и редкое напоминание в чат."""
+    chat = message.chat
+    status = await request_access(
+        message.bot, "chats", chat.id, one_line(chat.title),
+        await group_details(message.bot, chat, sender_of(message), "Запросил ссылкой"),
+    )
+    now = time.monotonic()
+    if status == "new" or (status == "pending" and now - access_reminded.get(chat.id, 0) > ACCESS_REMIND_SEC):
+        access_reminded[chat.id] = now
+        try:
+            await message.reply(
+                f"🔒 Качать видео в этом чате я могу только с разрешения автора. Напишите ему "
+                f"в личку — @{OWNER_USERNAME} — и попросите доступ для этого чата."
+            )
+        except (TelegramBadRequest, TelegramForbiddenError):
+            pass
+
+
+@router.my_chat_member(ChatMemberUpdatedFilter(member_status_changed=JOIN_TRANSITION))
+async def on_added_to_chat(event: ChatMemberUpdated) -> None:
+    chat = event.chat
+    if chat.type == ChatType.PRIVATE:
+        return
+    adder = event.from_user
+    log.info("меня добавили в «%s» (%s), добавил %s", one_line(chat.title), chat.id, adder.id if adder else "?")
+    if adder and adder.id in ALLOWED_USER_IDS:  # добавил сам автор — значит, разрешил
+        set_access("chats", chat.id, "allowed", one_line(chat.title))
+    status = access_status("chats", chat.id)
+    if status == "allowed":
+        text = "👋 Привет! Присылайте ссылки на видео из YouTube, Instagram, TikTok или X — скачаю и пришлю сюда."
+    elif status == "denied":
+        text = f"⛔ Автор (@{OWNER_USERNAME}) не разрешил мне работать в этом чате."
+    else:
+        await request_access(
+            event.bot, "chats", chat.id, one_line(chat.title),
+            await group_details(event.bot, chat, person(adder), "Добавил"),
+        )
+        access_reminded[chat.id] = time.monotonic()
+        text = (
+            f"👋 Привет! Качать видео в этом чате я могу только с разрешения автора. "
+            f"Напишите ему в личку — @{OWNER_USERNAME} — и попросите доступ для этого чата. "
+            "Как только он разрешит, я напишу сюда."
+        )
+    try:
+        await event.bot.send_message(chat.id, text)
+    except Exception as exc:
+        log.info("не смог поздороваться в %s: %s", chat.id, safe_error(exc))
+
+
+def access_list() -> tuple[str, InlineKeyboardMarkup]:
+    """Все группы и люди с решениями — для /access."""
+    entries = [
+        (kind, int(raw_id), record.get("title") or raw_id, record.get("status"))
+        for kind in ("chats", "users")
+        for raw_id, record in access[kind].items()
+    ]
+    entries += [
+        ("chats", chat_id, str(chat_id), "allowed")
+        for chat_id in ALLOWED_CHAT_IDS if str(chat_id) not in access["chats"]
+    ]
+    icons = {"allowed": "✅", "denied": "❌", "pending": "⏳"}
+    order = {"pending": 0, "allowed": 1, "denied": 2}
+    entries.sort(key=lambda e: (order.get(e[3], 3), e[0], str(e[2]).lower()))
+    if not entries:
+        return "Пока никто не просил доступ.", InlineKeyboardMarkup(inline_keyboard=[])
+    lines = ["<b>Доступ к боту</b>", "✅ разрешено · ❌ запрещено · ⏳ ждёт решения", ""]
+    rows = []
+    for kind, target_id, title, status in entries[:90]:  # у клавиатуры Telegram есть предел кнопок
+        label = one_line(str(title), 28)
+        what = "группа" if kind == "chats" else "личка"
+        lines.append(f"{icons.get(status, '?')} {html.escape(label)} — {what}, <code>{target_id}</code>")
+        code = f"acl:{kind[0]}:{target_id}"
+        if status == "allowed":
+            rows.append([InlineKeyboardButton(text=f"❌ Запретить · {label}", callback_data=f"{code}:n")])
+        elif status == "denied":
+            rows.append([InlineKeyboardButton(text=f"✅ Разрешить · {label}", callback_data=f"{code}:y")])
+        else:
+            rows.append([
+                InlineKeyboardButton(text=f"✅ {label}", callback_data=f"{code}:y"),
+                InlineKeyboardButton(text="❌", callback_data=f"{code}:n"),
+            ])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.message(Command("access"))
+async def cmd_access(message: Message) -> None:
+    if not (message.from_user and message.from_user.id in ALLOWED_USER_IDS):
+        return
+    if message.chat.type != ChatType.PRIVATE:
+        await message.reply("Список доступа показываю только в личке.")
+        return
+    text, keyboard = access_list()
+    await message.answer(text, reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith("acc:") | F.data.startswith("acl:"))
+async def cb_access(query: CallbackQuery) -> None:
+    """acc — кнопки под запросом, acl — под списком /access."""
+    if query.from_user.id not in ALLOWED_USER_IDS:
+        await query.answer("Решать может только автор бота.", show_alert=True)
+        return
+    try:
+        prefix, kind_code, raw_id, verdict = query.data.split(":")
+        kind = {"c": "chats", "u": "users"}[kind_code]
+        target_id = int(raw_id)
+        status = {"y": "allowed", "n": "denied"}[verdict]
+    except (ValueError, KeyError):
+        await query.answer("Непонятная кнопка.", show_alert=True)
+        return
+    await apply_decision(query.bot, kind, target_id, status)
+    await query.answer("Разрешено ✅" if status == "allowed" else "Запрещено ❌")
+    if not query.message:
+        return
+    try:
+        if prefix == "acl":
+            text, keyboard = access_list()
+            await query.message.edit_text(text, reply_markup=keyboard)
+        else:
+            base = (query.message.html_text or "").split("\n\nРешение:")[0]
+            verdict_text = "✅ разрешено" if status == "allowed" else "❌ запрещено"
+            await query.message.edit_text(
+                f"{base}\n\nРешение: {verdict_text}. Передумать — кнопкой ниже или в /access.",
+                reply_markup=decision_kb(kind, target_id, status),
+            )
+    except TelegramBadRequest:  # текст не изменился — ничего страшного
+        pass
+
+
 @router.message(CommandStart())
 @router.message(Command("help"))
 async def cmd_start(message: Message) -> None:
     if not is_allowed(message):
         if message.chat.type == ChatType.PRIVATE:
-            await message.reply("⛔ Это личный бот, доступ только по списку.")
+            await ask_stranger(message)
         return
     await message.answer(WELCOME)
 
@@ -1454,7 +1752,7 @@ async def handle_link(message: Message) -> None:
     is_private = message.chat.type == ChatType.PRIVATE
     allowed = is_allowed(message)
     if is_private and not allowed:
-        await message.reply("⛔ Это личный бот, доступ только по списку.")
+        await ask_stranger(message)
         return
 
     match = URL_RE.search(message.text)
@@ -1469,10 +1767,7 @@ async def handle_link(message: Message) -> None:
             await message.reply("Я принимаю только HTTPS-ссылки из YouTube, Instagram, TikTok и X.")
         return
     if not allowed:
-        await message.reply(
-            "⛔ Эта группа не в списке разрешённых.\n"
-            "Пришли /id и добавь id чата в ALLOWED_CHAT_IDS в .env бота."
-        )
+        await ask_for_group(message)
         return
 
     key = url_key(url)
@@ -1747,9 +2042,14 @@ async def download_and_send(
     except Exception as exc:
         # Не печатаем traceback: сообщения исключений внешних библиотек могут содержать
         # подписанные URL. Тип и очищенный текст оставляют достаточно данных для диагностики.
+        # только файл:строка:функция — в них нет URL, а место падения видно
+        frames = " ← ".join(
+            f"{Path(frame.filename).name}:{frame.lineno}:{frame.name}"
+            for frame in reversed(traceback.extract_tb(exc.__traceback__)[-6:])
+        )
         log.error(
-            "Не смог обработать [%s] (%s): %s",
-            key, type(exc).__name__, safe_error(exc),
+            "Не смог обработать [%s] (%s): %s | %s",
+            key, type(exc).__name__, safe_error(exc), frames,
         )
         await show_error(status, "💥 Что-то пошло не так. Подробности в логах бота.")
     finally:
@@ -1836,6 +2136,7 @@ async def main() -> None:
     ig_auth_available()  # загрузить сохранённую блокировку до фоновых задач и polling
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     load_cache()
+    load_access()
     session = None
     if TELEGRAM_API_URL:
         # локальный Bot API server: лимит на отправку 2 ГБ вместо 50 МБ
