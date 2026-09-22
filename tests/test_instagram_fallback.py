@@ -200,3 +200,34 @@ class ErrorTextTests(unittest.TestCase):
         self.assertIn("TikTok", bot.friendly_dlp_error(tiktok, "tt"))
         live = bot.yt_dlp.utils.DownloadError("ERROR: [youtube] x: This live event will begin in 63 minutes.")
         self.assertIn("ещё не началась", bot.friendly_dlp_error(live, "yt"))
+
+
+class AudienceRestrictedTests(unittest.TestCase):
+    """Пост с возрастным/страновым ограничением: анонимно нельзя, надо пробовать с аккаунтом."""
+
+    setUp = InstagramFallbackTests.setUp
+    write_session = InstagramFallbackTests.write_session
+
+    def test_restricted_post_is_retried_with_account(self):
+        attempts = []
+
+        def grab(url, workdir, hook, with_cookies):
+            attempts.append(with_cookies)
+            if not with_cookies:
+                raise bot.yt_dlp.utils.DownloadError(
+                    "ERROR: [Instagram] x: This content isn't available to everyone: "
+                    "It can't be seen by certain audiences."
+                )
+            return self.root / "video.mp4", {}
+
+        path, info = bot._with_cookie_retry(grab, URL, self.root, None)
+        self.assertEqual(attempts, [False, True])
+        self.assertEqual(path.name, "video.mp4")
+        self.assertIn("_ig_authenticated", info)
+
+    def test_message_explains_age_restriction(self):
+        exc = bot.yt_dlp.utils.DownloadError(
+            "ERROR: [Instagram] x: This content isn't available to everyone: It can't be seen by certain audiences."
+        )
+        text = bot.friendly_dlp_error(exc, "ig")
+        self.assertIn("возрастное", text)

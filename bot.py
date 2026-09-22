@@ -1321,6 +1321,8 @@ def _with_cookie_retry(fn, url: str, workdir: Path, on_progress) -> tuple[Path, 
         ig_needs_login = service == "ig" and any(marker in str(exc).lower() for marker in (
             "login required", "log in", "empty media response", "requested content is not available",
             "private", "400: bad request",
+            # возрастное или страновое ограничение: анонимно Instagram такой пост не покажет
+            "available to everyone", "certain audiences",
         ))
         if (has_cookie_fallback(service) and (is_auth_error(exc) or ig_needs_login)
                 and not (service == "ig" and is_rate_limited(exc))):
@@ -1484,6 +1486,12 @@ def friendly_dlp_error(exc: yt_dlp.utils.DownloadError, service: str = "") -> st
         return (
             "🔞 У этого видео возрастное ограничение — YouTube отдаёт его только "
             "залогиненным, а cookies YouTube у бота нет. Скачать не получится."
+        )
+    if "available to everyone" in low or "certain audiences" in low:
+        return (
+            "🔞 Instagram отдаёт этот пост только залогиненным: у него возрастное или страновое "
+            "ограничение. Аккаунт у бота есть, но и ему Instagram доступ не дал — "
+            "похоже, на аккаунте не подтверждён возраст."
         )
     if "404" in low and "not found" in low:
         return "🗑 Похоже, пост удалён или ссылка битая (404)."
