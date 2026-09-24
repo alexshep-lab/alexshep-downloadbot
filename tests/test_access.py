@@ -47,7 +47,8 @@ class AccessTests(unittest.TestCase):
         self.assertEqual(len(owner_calls), 1)
         self.assertIn("&lt;script&gt;", owner_calls[0].args[1])  # имя экранировано
         self.assertIn("@AlexShep", msg.reply.call_args_list[0].args[0])
-        self.assertIn("напиши @AlexShep", msg.reply.call_args_list[1].args[0])
+        # на второе сообщение подряд не отвечаем: раз в ACCESS_REMIND_SEC, чтобы не упереться в лимиты
+        self.assertEqual(msg.reply.await_count, 1)
         self.assertEqual(bot.access_status("users", STRANGER), "pending")
 
     def test_decision_opens_access_and_can_be_changed(self):
@@ -88,6 +89,30 @@ class AccessTests(unittest.TestCase):
         self.assertIn(f"acl:u:{STRANGER}:y", data)
         self.assertIn("acl:c:-100111:n", data)  # группа из .env тоже управляется
         self.assertTrue(all(len(d.encode()) <= 64 for d in data))
+
+
+class AccessLimitsTests(AccessTests):
+    """Защита от спама: лимит ожидающих запросов, ленивое описание, битый access.json."""
+
+    def test_pending_cap_stops_new_requests_and_notifications(self):
+        with patch.object(bot, "MAX_PENDING_ACCESS", 2):
+            for user_id in (1001, 1002, 1003):
+                run(bot.ask_stranger(fake_message(user_id, bot.ChatType.PRIVATE, user_id)))
+        self.assertEqual(bot.access_status("users", 1003), None)
+        self.assertEqual(sum(r["status"] == "pending" for r in bot.access["users"].values()), 2)
+
+    def test_group_details_fetched_only_for_new_request(self):
+        msg = fake_message(GROUP, bot.ChatType.SUPERGROUP, STRANGER)
+        run(bot.ask_for_group(msg))
+        run(bot.ask_for_group(msg))
+        self.assertEqual(msg.bot.get_chat_member_count.await_count, 1)
+
+    def test_malformed_access_file_is_ignored(self):
+        for payload in ("[]", '{"chats": []}', '{"users": {"x": 1, "5": "bad", "7": {"status": "allowed"}}}'):
+            bot.ACCESS_FILE.write_text(payload, encoding="utf-8")
+            with patch.object(bot, "access", {"chats": {}, "users": {}}):
+                bot.load_access()  # не должно падать
+                self.assertEqual(list(bot.access["users"]), ["7"] if "7" in payload else [])
 
 
 if __name__ == "__main__":

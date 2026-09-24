@@ -4,6 +4,8 @@
 """
 
 import asyncio
+import collections
+import contextlib
 import hashlib
 import html
 import io
@@ -39,6 +41,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InputMediaPhoto,
     InputMediaVideo,
+    LinkPreviewOptions,
     Message,
 )
 from dotenv import load_dotenv
@@ -98,6 +101,8 @@ ERROR_TTL_SEC = int(os.getenv("ERROR_TTL_SEC", "60"))
 TRANSCODE_MAX_DURATION_MIN = int(os.getenv("TRANSCODE_MAX_DURATION_MIN", "5"))
 # как часто проверять, что сессия Instagram в cookies ещё жива, минут
 IG_SESSION_CHECK_MIN = int(os.getenv("IG_SESSION_CHECK_MIN", "60"))
+# присылать владельцам в личку отчёт о каждой неудачной загрузке (1/0)
+OWNER_ERROR_REPORTS = os.getenv("OWNER_ERROR_REPORTS", "1").strip().lower() not in {"0", "false", "no", ""}
 
 DOWNLOAD_ATTEMPTS = 3  # сколько раз пробовать при временных ошибках (403 и т.п.)
 RETRY_DELAYS = (15, 45)  # паузы перед 2-й и 3-й попыткой, сек
@@ -108,6 +113,8 @@ MAX_METADATA_SIZE = 5 * 1024 * 1024
 HEIGHT_LADDER = tuple(h for h in (2160, 1440, 1080, 720, 480, 360) if h <= MAX_HEIGHT) or (360,)
 
 URL_RE = re.compile(r"https?://\S+")
+# «(https://youtu.be/abc)» или «https://youtu.be/abc, смотри» — хвостовая пунктуация не часть ссылки
+URL_TRAILING_PUNCTUATION = ".,;:!?)]}>»\"'…"
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")  # yt-dlp вставляет цветовые коды консоли в текст ошибок
 SUPPORTED_HOSTS = (
     "youtube.com", "youtu.be", "instagram.com", "instagr.am",
@@ -118,6 +125,7 @@ log = logging.getLogger("downloadbot")
 router = Router()
 download_slots = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 request_state_lock = asyncio.Lock()
+ig_queue = asyncio.Lock()  # закачки из Instagram идут по одной, см. download_and_send
 pending_requests = 0
 pending_by_user: dict[int, int] = {}
 
@@ -264,8 +272,14 @@ def url_key(url: str) -> str:
         if len(path) >= 2 and path[0] in ("shorts", "live", "embed"):
             return f"yt:{safe_key_part(path[1])}"
     if "instagram" in host and path:
-        # весь путь целиком: у историй он вида /stories/автор/id, и по первым двум
-        # сегментам разные истории одного автора слились бы в один ключ
+        # /p/КОД, /reel/КОД, /reels/КОД, /tv/КОД и /автор/p/КОД — один и тот же пост:
+        # сводим к одному ключу, иначе кеш промахивается и пост качается заново, порой с аккаунтом.
+        # Форма «reel» — потому что так записана большая часть уже накопленного кеша.
+        for marker in ("p", "reel", "reels", "tv"):
+            if marker in path and len(path) > path.index(marker) + 1:
+                return f"ig:reel:{safe_key_part(path[path.index(marker) + 1])}"
+        # остальное (сторис /stories/автор/id и т. п.) — весь путь целиком: по первым двум
+        # сегментам разные сторис одного автора слились бы в один ключ
         return "ig:" + ":".join(safe_key_part(part) for part in path)
     if host.endswith("tiktok.com") and path:
         # /@user/video/123456 — длинная ссылка; vm./vt./t/КОД — короткая, ключуем по коду
@@ -310,21 +324,47 @@ class TooLargeError(Exception):
 # разрешения для групп, у которых ещё нет записи (их тоже можно отозвать через /access).
 OWNER_USERNAME = os.getenv("OWNER_USERNAME", "AlexShep").strip().lstrip("@")
 ACCESS_FILE = CACHE_FILE.with_name("access.json")
-ACCESS_REMIND_SEC = 600  # в ожидающей группе напоминаем о запросе не чаще раза в 10 минут
+ACCESS_REMIND_SEC = 600  # незнакомцу и ожидающей группе отвечаем не чаще раза в 10 минут
+# Сколько запросов может одновременно ждать решения. Сверх этого новые не записываются
+# и не приходят владельцу: иначе пачка свежих аккаунтов завалила бы ему личку.
+MAX_PENDING_ACCESS = 30
 access: dict[str, dict[str, dict]] = {"chats": {}, "users": {}}
 access_reminded: dict[int, float] = {}
+
+
+def should_remind(chat_id: int) -> bool:
+    """Ответить незнакомцу или группе без одобрения? Не чаще раза в ACCESS_REMIND_SEC."""
+    now = time.monotonic()
+    if len(access_reminded) > 1000:  # не копим старые отметки бесконечно
+        for stale in [c for c, at in access_reminded.items() if now - at > ACCESS_REMIND_SEC]:
+            del access_reminded[stale]
+    if now - access_reminded.get(chat_id, -ACCESS_REMIND_SEC) <= ACCESS_REMIND_SEC:
+        return False
+    access_reminded[chat_id] = now
+    return True
 
 
 def load_access() -> None:
     try:
         data = json.loads(ACCESS_FILE.read_text(encoding="utf-8"))
-        for kind in access:
-            access[kind].update(data.get(kind) or {})
-        log.info("доступ: %d групп, %d человек в списке", len(access["chats"]), len(access["users"]))
     except FileNotFoundError:
-        pass
+        return
     except (OSError, ValueError) as exc:
         log.warning("не смог прочитать %s: %s", ACCESS_FILE, safe_error(exc))
+        return
+    if not isinstance(data, dict):
+        # файл правили руками — лучше начать с пустого списка, чем уйти в перезапуски
+        log.warning("%s: ожидался объект, пропускаю файл", ACCESS_FILE)
+        return
+    for kind in access:
+        records = data.get(kind)
+        if not isinstance(records, dict):
+            continue
+        access[kind].update(
+            (str(target), record) for target, record in records.items()
+            if isinstance(record, dict) and str(target).lstrip("-").isdigit()
+        )
+    log.info("доступ: %d групп, %d человек в списке", len(access["chats"]), len(access["users"]))
 
 
 def save_access() -> None:
@@ -452,6 +492,14 @@ def describe_sender(message: Message) -> str:
     if message.chat.type == ChatType.PRIVATE:
         return f"{who} в личке"
     return f"{who} в группе «{one_line(message.chat.title)}» ({message.chat.id})"
+
+
+def find_urls(text: str | None) -> list[str]:
+    """Все ссылки из текста без хвостовой пунктуации, в порядке появления."""
+    return [
+        url for url in (m.group(0).rstrip(URL_TRAILING_PUNCTUATION) for m in URL_RE.finditer(text or ""))
+        if url
+    ]
 
 
 def is_supported(url: str) -> bool:
@@ -623,6 +671,92 @@ async def notify_owners(bot: Bot, text: str, **kwargs) -> None:
             await bot.send_message(user_id, text, **kwargs)
         except Exception as exc:  # владелец не запускал бота в личке и т.п.
             log.warning("не смог написать владельцу %s: %s", user_id, safe_error(exc))
+
+
+# Отчёты владельцу о неудачных загрузках — чтобы не лазить за ними в журнал сервера.
+ERROR_REPORT_REPEAT_SEC = 600  # одну и ту же ошибку повторяем не чаще раза в 10 минут
+MAX_ERROR_REPORTS_PER_HOUR = 20  # потолок на случай, когда ломается всё сразу
+error_report_last: dict[str, float] = {}
+error_report_times: collections.deque[float] = collections.deque()
+
+
+def error_report_allowed(signature: str) -> bool:
+    now = time.monotonic()
+    while error_report_times and now - error_report_times[0] > 3600:
+        error_report_times.popleft()
+    if len(error_report_times) >= MAX_ERROR_REPORTS_PER_HOUR:
+        return False
+    if now - error_report_last.get(signature, -ERROR_REPORT_REPEAT_SEC) <= ERROR_REPORT_REPEAT_SEC:
+        return False
+    if len(error_report_last) > 500:  # старые подписи не нужны
+        for stale in [s for s, at in error_report_last.items() if now - at > ERROR_REPORT_REPEAT_SEC]:
+            del error_report_last[stale]
+    error_report_last[signature] = now
+    error_report_times.append(now)
+    return True
+
+
+async def report_failure(
+    message: Message, key: str, url: str, kind: str, what: str, detail: str, answer: str | None = None
+) -> None:
+    """Пишет владельцам, что у кого-то не скачалось. Все строки уже без токенов из URL."""
+    if not OWNER_ERROR_REPORTS:
+        return
+    if message.chat.type == ChatType.PRIVATE and message.chat.id in ALLOWED_USER_IDS:
+        return  # ошибку в своей личке владелец и так видит
+    # подпись без чисел: «HTTP Error 403» из разных роликов — одна и та же поломка
+    signature = f"{service_of(key)}:{what}:{re.sub(r'[0-9]+', '#', detail)[:120]}"
+    if not error_report_allowed(signature):
+        return
+    lines = [
+        f"⚠️ <b>Не скачалось</b> ({html.escape(what)})",
+        f"Кто: {html.escape(describe_sender(message))}",
+        f"Что: <code>{html.escape(key)}</code> {'· звук' if kind == 'audio' else ''}",
+        f"Ссылка: {html.escape(safe_url_for_log(url))}",
+    ]
+    if answer:
+        lines.append(f"Ответ пользователю: {html.escape(one_line(answer, 200))}")
+    lines.append(f"<code>{html.escape(detail[:700])}</code>")
+    await notify_owners(
+        message.bot, "\n".join(lines), link_preview_options=LinkPreviewOptions(is_disabled=True)
+    )
+
+
+class RecentLogs(logging.Handler):
+    """Последние записи журнала в памяти — для команды /logs.
+
+    Берём записи бота и предупреждения/ошибки остальных библиотек; поток
+    «Update id=… is handled» от aiogram сюда не попадает.
+    """
+
+    def __init__(self, capacity: int = 400) -> None:
+        super().__init__()
+        self.records: collections.deque[tuple[int, str]] = collections.deque(maxlen=capacity)
+        self.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%d.%m %H:%M:%S"))
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if record.name != log.name and record.levelno < logging.WARNING:
+            return
+        try:
+            self.records.append((record.levelno, self.format(record)))
+        except Exception:
+            self.handleError(record)
+
+    def tail(self, everything: bool, limit: int = 3800) -> str:
+        """Последние строки, новые снизу, в пределах limit символов."""
+        picked, size = [], 0
+        for level, line in reversed(self.records):
+            if not everything and level < logging.WARNING:
+                continue
+            line = one_line(line, 400)
+            if size + len(line) + 1 > limit:
+                break
+            picked.append(line)
+            size += len(line) + 1
+        return "\n".join(reversed(picked))
+
+
+recent_logs = RecentLogs()
 
 
 async def set_ig_state(bot: Bot, state: str) -> None:
@@ -956,7 +1090,10 @@ def _moov_first(path: Path) -> bool:
             if kind == b"mdat":
                 return False
             if size == 1:  # размер бокса не влез в 32 бита
-                size = struct.unpack(">Q", f.read(8))[0] - 8
+                extended = f.read(8)
+                if len(extended) < 8:  # файл обрезан посреди заголовка
+                    return False
+                size = struct.unpack(">Q", extended)[0] - 8
             elif size < 8:
                 return False
             f.seek(size - 8, os.SEEK_CUR)
@@ -1552,16 +1689,25 @@ def decision_kb(kind: str, target_id: int, status: str, prefix: str = "acc") -> 
     return InlineKeyboardMarkup(inline_keyboard=[buttons])
 
 
-async def request_access(bot: Bot, kind: str, target_id: int, title: str, details: str) -> str:
-    """Отправляет владельцу запрос на доступ, если его ещё не было. Возвращает new | pending | denied | allowed."""
+async def request_access(bot: Bot, kind: str, target_id: int, title: str, describe) -> str:
+    """Отправляет владельцу запрос на доступ, если его ещё не было.
+
+    describe — async-функция с описанием для владельца: вызываем её только для нового
+    запроса, потому что для группы она ходит в Telegram за числом участников.
+    Возвращает new | pending | denied | allowed | busy (очередь запросов переполнена).
+    """
     status = access_status(kind, target_id)
     if status:
         return status
+    pending = sum(1 for records in access.values() for r in records.values() if r.get("status") == "pending")
+    if pending >= MAX_PENDING_ACCESS:
+        log.warning("запросов на доступ уже %d — %s %s не записываю", pending, kind, target_id)
+        return "busy"
     set_access(kind, target_id, "pending", title)
     log.info("запрос доступа: %s %s «%s»", kind, target_id, one_line(title))
     await notify_owners(
         bot,
-        f"📥 <b>Запрос на доступ к боту</b>\n{details}\n\nИм сказано написать тебе в личку.",
+        f"📥 <b>Запрос на доступ к боту</b>\n{await describe()}\n\nИм сказано написать тебе в личку.",
         reply_markup=decision_kb(kind, target_id, "pending"),
     )
     return "new"
@@ -1596,36 +1742,44 @@ async def apply_decision(bot: Bot, kind: str, target_id: int, status: str) -> No
 
 
 async def ask_stranger(message: Message) -> None:
-    """Незнакомец в личке: просим разрешение у автора и объясняем, что происходит."""
+    """Незнакомец в личке: просим разрешение у автора и объясняем, что происходит.
+
+    Отвечаем не на каждое сообщение, а раз в ACCESS_REMIND_SEC: иначе поток сообщений
+    от одного человека загнал бы бота в лимиты Telegram, и тормозили бы ответы всем.
+    """
+    async def describe() -> str:
+        return f"Личные сообщения\nПользователь: {person(message.from_user)}"
+
     status = await request_access(
-        message.bot, "users", message.chat.id, one_line(message.from_user.full_name if message.from_user else ""),
-        f"Личные сообщения\nПользователь: {person(message.from_user)}",
+        message.bot, "users", message.chat.id,
+        one_line(message.from_user.full_name if message.from_user else ""), describe,
+    )
+    ask_owner = (
+        f"🔒 Скачивать я могу только с разрешения автора. Напиши ему в личку — "
+        f"@{OWNER_USERNAME} — и попроси доступ."
     )
     text = {
-        "new": (
-            f"🔒 Скачивать я могу только с разрешения автора. Напиши ему в личку — "
-            f"@{OWNER_USERNAME} — и попроси доступ. Как только он разрешит, я сообщу сюда."
-        ),
+        "new": f"{ask_owner} Как только он разрешит, я сообщу сюда.",
+        "busy": ask_owner,
         "pending": (
             f"⏳ Доступа пока нет. Если ещё не написал автору — напиши @{OWNER_USERNAME} "
             "и попроси доступ."
         ),
         "denied": f"⛔ Автор не открыл доступ. По вопросам — @{OWNER_USERNAME}.",
     }.get(status)
-    if text:
+    if text and should_remind(message.chat.id):
         await message.reply(text)
 
 
 async def ask_for_group(message: Message) -> None:
     """Ссылка в группе, которой ещё не разрешили: запрос автору и редкое напоминание в чат."""
     chat = message.chat
-    status = await request_access(
-        message.bot, "chats", chat.id, one_line(chat.title),
-        await group_details(message.bot, chat, sender_of(message), "Запросил ссылкой"),
-    )
-    now = time.monotonic()
-    if status == "new" or (status == "pending" and now - access_reminded.get(chat.id, 0) > ACCESS_REMIND_SEC):
-        access_reminded[chat.id] = now
+
+    async def describe() -> str:
+        return await group_details(message.bot, chat, sender_of(message), "Запросил ссылкой")
+
+    status = await request_access(message.bot, "chats", chat.id, one_line(chat.title), describe)
+    if status in ("new", "pending", "busy") and should_remind(chat.id):
         try:
             await message.reply(
                 f"🔒 Качать видео в этом чате я могу только с разрешения автора. Напишите ему "
@@ -1650,11 +1804,11 @@ async def on_added_to_chat(event: ChatMemberUpdated) -> None:
     elif status == "denied":
         text = f"⛔ Автор (@{OWNER_USERNAME}) не разрешил мне работать в этом чате."
     else:
-        await request_access(
-            event.bot, "chats", chat.id, one_line(chat.title),
-            await group_details(event.bot, chat, person(adder), "Добавил"),
-        )
-        access_reminded[chat.id] = time.monotonic()
+        async def describe() -> str:
+            return await group_details(event.bot, chat, person(adder), "Добавил")
+
+        await request_access(event.bot, "chats", chat.id, one_line(chat.title), describe)
+        access_reminded[chat.id] = time.monotonic()  # только что всё объяснили — не повторяем сразу
         text = (
             f"👋 Привет! Качать видео в этом чате я могу только с разрешения автора. "
             f"Напишите ему в личку — @{OWNER_USERNAME} — и попросите доступ для этого чата. "
@@ -1699,6 +1853,29 @@ def access_list() -> tuple[str, InlineKeyboardMarkup]:
                 InlineKeyboardButton(text="❌", callback_data=f"{code}:n"),
             ])
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.message(Command("logs"))
+async def cmd_logs(message: Message) -> None:
+    """/logs — предупреждения и ошибки, /logs all — все события бота. Только владельцу в личке."""
+    if not (message.from_user and message.from_user.id in ALLOWED_USER_IDS):
+        return
+    if message.chat.type != ChatType.PRIVATE:
+        await message.reply("Журнал показываю только в личке: в нём имена и чаты других людей.")
+        return
+    everything = (message.text or "").split()[1:2] == ["all"]
+    text = recent_logs.tail(everything)
+    if not text:
+        await message.answer(
+            "С последнего запуска бота ошибок не было. Все события — /logs all"
+            if not everything else "Журнал пока пуст."
+        )
+        return
+    title = "Все события" if everything else "Предупреждения и ошибки"
+    await message.answer(
+        f"<b>{title}</b> (с запуска бота, новые снизу):\n<pre>{html.escape(text)}</pre>",
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
+    )
 
 
 @router.message(Command("access"))
@@ -1774,14 +1951,15 @@ async def handle_link(message: Message) -> None:
         await ask_stranger(message)
         return
 
-    match = URL_RE.search(message.text)
-    if not match:
+    urls = find_urls(message.text)
+    if not urls:
         # в группах на обычную болтовню не реагируем
         if is_private:
             await message.reply("Пришли ссылку на видео из YouTube, Instagram, TikTok или X.")
         return
-    url = match.group(0)
-    if not is_supported(url):
+    # берём первую поддерживаемую: «статья https://site.ru и видео https://youtu.be/…» — это видео
+    url = next((u for u in urls if is_supported(u)), None)
+    if url is None:
         if is_private:
             await message.reply("Я принимаю только HTTPS-ссылки из YouTube, Instagram, TikTok и X.")
         return
@@ -1864,11 +2042,32 @@ async def deliver(
 
 
 ALBUM_SIZE = 10  # больше Telegram в один альбом не кладёт
+CAPTION_LIMIT = 1024  # символов в подписи к медиа, считая HTML-разметку
 
 
-async def send_album(message: Message, items: list, caption: str | None) -> list[list[str]]:
-    """Шлёт фото и видео альбомами; items — [(вид, файл или file_id), …]. Возвращает file_id для кеша."""
-    sent_ids = []
+def tg_caption(title: str | None) -> str | None:
+    """Название → подпись для режима HTML, которая гарантированно влезает в лимит Telegram.
+
+    Резать надо до экранирования: «&» превращается в «&amp;», и обрезка уже
+    экранированного текста могла бы разрезать сущность пополам.
+    """
+    text = title or ""
+    escaped = html.escape(text)
+    while len(escaped) > CAPTION_LIMIT:
+        text = text[: len(text) - (len(escaped) - CAPTION_LIMIT) - 1]
+        escaped = html.escape(text + "…")
+    return escaped or None
+
+
+async def send_album(
+    message: Message, items: list, caption: str | None, sent_ids: list | None = None
+) -> list[list[str]]:
+    """Шлёт фото и видео альбомами; items — [(вид, файл или file_id), …]. Возвращает file_id для кеша.
+
+    sent_ids можно передать снаружи: если отправка оборвётся посередине, вызывающий
+    увидит, что часть альбома уже в чате, и не станет слать всё заново.
+    """
+    sent_ids = [] if sent_ids is None else sent_ids
     for start in range(0, len(items), ALBUM_SIZE):
         chunk = items[start:start + ALBUM_SIZE]
         chunk_caption = caption if start == 0 else None
@@ -1901,10 +2100,11 @@ async def send_cached(message: Message, status: Message, key: str, kind: str) ->
     if not entry:
         return False
     # в кеше название сырое; без экранирования «Tom & Jerry» роняет отправку в режиме HTML
-    caption = html.escape(entry.get("title") or "") or None
+    caption = tg_caption(entry.get("title"))
+    sent: list = []
     try:
         if entry.get("album"):
-            await send_album(message, [tuple(item) for item in entry["album"]], caption)
+            await send_album(message, [tuple(item) for item in entry["album"]], caption, sent)
         elif kind == "audio":
             await message.reply_audio(entry["file_id"], caption=caption)
         else:
@@ -1914,10 +2114,40 @@ async def send_cached(message: Message, status: Message, key: str, kind: str) ->
         await status.delete()
         return True
     except Exception as exc:
-        log.warning("не смог отправить из кеша (%s), качаю заново: %s", key, exc)
+        if sent:
+            # часть альбома уже в чате: перекачка прислала бы её второй раз, а file_id живые
+            log.warning("альбом из кеша (%s) ушёл не целиком, %d шт.: %s", key, len(sent), safe_error(exc))
+            await show_error(status, "📶 Часть альбома не отправилась — пришли ссылку ещё раз чуть позже.")
+            return True
+        log.warning("не смог отправить из кеша (%s), качаю заново: %s", key, safe_error(exc))
         file_ids.pop(cache_key(key, kind), None)
         save_cache()
         return False
+
+
+class DownloadTimedOut(Exception):
+    """Скачивание не уложилось в DOWNLOAD_TIMEOUT; пользователю уже сообщили."""
+
+
+async def run_download(job: Job, status: Message, grab, *args):
+    """Скачивание в потоке с таймаутом.
+
+    По таймауту сразу сообщаем пользователю, но ждём, пока поток действительно
+    остановится (на ближайшем хуке yt-dlp или ffmpeg). Слот закачки и рабочая папка
+    держатся до этого момента: иначе поток работал бы сверх лимита одновременных
+    закачек и писал в уже удалённую папку.
+    """
+    task = asyncio.ensure_future(asyncio.to_thread(grab, *args))
+    try:
+        return await asyncio.wait_for(asyncio.shield(task), timeout=DOWNLOAD_TIMEOUT)
+    except asyncio.TimeoutError:
+        job.cancelled = True
+        await show_error(status, "⌛ Скачивание не уложилось в таймаут. Попробуй ещё раз или видео покороче.")
+        try:
+            await task
+        except Exception:  # поток прервался на хуке или упал сам — результат уже не нужен
+            pass
+        raise DownloadTimedOut from None
 
 
 async def download_and_send(
@@ -1934,15 +2164,15 @@ async def download_and_send(
             "🔍 Смотрю, что за видео…" if kind == "video" else "🎵 Достаю звуковую дорожку…",
             reply_markup=progress_kb(job),
         )
+        # Instagram встаёт в свою очередь до того, как занять слот: запросы с аккаунтом идут
+        # по одному, и без этого две такие закачки заняли бы оба слота, а YouTube ждал бы их.
+        ig_turn = ig_queue if service_of(key) == "ig" else contextlib.nullcontext()
         # временные ошибки (403 и т.п.) пересиливаем сами: пауза и новая попытка
         for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
             try:
-                async with download_slots:
+                async with ig_turn, download_slots:
                     job.check()
-                    path, info = await asyncio.wait_for(
-                        asyncio.to_thread(grab, url, workdir, reporter.hook),
-                        timeout=DOWNLOAD_TIMEOUT,
-                    )
+                    path, info = await run_download(job, status, grab, url, workdir, reporter.hook)
                 break
             except yt_dlp.utils.DownloadError as exc:
                 if attempt == DOWNLOAD_ATTEMPTS or not is_transient_dlp_error(exc):
@@ -1964,7 +2194,7 @@ async def download_and_send(
             await status.edit_text(f"📤 Отправляю в Telegram… ({len(album)} шт.)")
             await message.bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_PHOTO)
             sent_ids = await send_album(
-                message, [(item_kind, FSInputFile(item)) for item_kind, item in album], html.escape(title)
+                message, [(item_kind, FSInputFile(item)) for item_kind, item in album], tg_caption(title)
             )
             if sent_ids:
                 cache_put_album(key, kind, sent_ids, title)
@@ -1987,7 +2217,7 @@ async def download_and_send(
         if kind == "audio":
             send = message.reply_audio(
                 FSInputFile(path),
-                caption=html.escape(title),
+                caption=tg_caption(title),
                 title=(info.get("track") or info.get("title") or "")[:64] or None,
                 performer=(info.get("artist") or info.get("uploader") or "")[:64] or None,
                 duration=int(info.get("duration") or 0) or None,
@@ -1995,7 +2225,7 @@ async def download_and_send(
         else:
             send = message.reply_video(
                 FSInputFile(path),
-                caption=html.escape(title),
+                caption=tg_caption(title),
                 duration=int(info.get("duration") or 0) or None,
                 width=info.get("width"),
                 height=info.get("height"),
@@ -2033,10 +2263,9 @@ async def download_and_send(
             else f"😞 Видео не влезает в {MAX_FILE_SIZE_MB} МБ даже в {HEIGHT_LADDER[-1]}p."
         )
         await show_error(status, f"{limit_note}\n{hint}")
-    except asyncio.TimeoutError:
-        # wait_for бросил ждать, но поток yt-dlp ещё качает — остановится на ближайшем хуке
-        job.cancelled = True
-        await show_error(status, "⌛ Скачивание не уложилось в таймаут. Попробуй ещё раз или видео покороче.")
+    except DownloadTimedOut:
+        log.warning("[%s/%s] не уложилось в %d с", key, kind, DOWNLOAD_TIMEOUT)
+        await report_failure(message, key, url, kind, "таймаут", f"дольше {DOWNLOAD_TIMEOUT} с")
     except yt_dlp.utils.DownloadError as exc:
         service = service_of(key)
         if is_rate_limited(exc):
@@ -2049,7 +2278,9 @@ async def download_and_send(
             log.warning("yt-dlp error for %s: %s", safe_url_for_log(url), safe_error(exc))
         if service == "ig":
             await check_ig_session(message.bot)
-        await show_error(status, friendly_dlp_error(exc, service))
+        answer = friendly_dlp_error(exc, service)
+        await show_error(status, answer)
+        await report_failure(message, key, url, kind, "ошибка загрузки", safe_error(exc, 700), answer)
     except TelegramNetworkError as exc:
         log.warning("upload failed for %s: %s", safe_url_for_log(url), safe_error(exc))
         await show_error(
@@ -2058,6 +2289,7 @@ async def download_and_send(
             "не хватило таймаута на отправку. Попробуй ещё раз; если повторяется, "
             "увеличь UPLOAD_TIMEOUT в .env.",
         )
+        await report_failure(message, key, url, kind, "не ушло в Telegram", safe_error(exc, 700))
     except Exception as exc:
         # Не печатаем traceback: сообщения исключений внешних библиотек могут содержать
         # подписанные URL. Тип и очищенный текст оставляют достаточно данных для диагностики.
@@ -2071,6 +2303,10 @@ async def download_and_send(
             key, type(exc).__name__, safe_error(exc), frames,
         )
         await show_error(status, "💥 Что-то пошло не так. Подробности в логах бота.")
+        await report_failure(
+            message, key, url, kind, "внутренняя ошибка",
+            f"{type(exc).__name__}: {safe_error(exc)} | {frames}",
+        )
     finally:
         job.close()
         shutil.rmtree(workdir, ignore_errors=True)
@@ -2151,6 +2387,7 @@ def validate_security_config() -> None:
 
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.getLogger().addHandler(recent_logs)
     validate_security_config()
     ig_auth_available()  # загрузить сохранённую блокировку до фоновых задач и polling
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
