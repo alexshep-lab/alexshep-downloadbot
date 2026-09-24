@@ -2385,6 +2385,12 @@ def validate_security_config() -> None:
             )
 
 
+# Все ответы бота — ответы на сообщение со ссылкой. Если его успели удалить, Telegram
+# отклоняет ответ («message to be replied not found»), и готовое видео пропадало бы
+# с ошибкой. С этим флагом оно просто уходит в чат обычным сообщением.
+BOT_DEFAULTS = DefaultBotProperties(parse_mode=ParseMode.HTML, allow_sending_without_reply=True)
+
+
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger().addHandler(recent_logs)
@@ -2397,7 +2403,7 @@ async def main() -> None:
     if TELEGRAM_API_URL:
         # локальный Bot API server: лимит на отправку 2 ГБ вместо 50 МБ
         session = AiohttpSession(api=TelegramAPIServer.from_base(TELEGRAM_API_URL, is_local=True))
-    bot = Bot(BOT_TOKEN, session=session, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    bot = Bot(BOT_TOKEN, session=session, default=BOT_DEFAULTS)
     dp = Dispatcher()
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=True)

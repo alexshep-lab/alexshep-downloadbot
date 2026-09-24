@@ -100,5 +100,18 @@ class CachedAlbumTests(unittest.TestCase):
         self.assertIn("ig:reel:X", cache)
 
 
+class DeletedLinkMessageTests(unittest.TestCase):
+    def test_replies_survive_deleted_original(self):
+        from aiogram import Bot
+        from aiogram.types import Message as TgMessage
+
+        tg = Bot("1:" + "a" * 35, default=bot.BOT_DEFAULTS)
+        msg = TgMessage.model_validate(
+            {"message_id": 5, "date": 0, "chat": {"id": -100, "type": "supergroup"}}, context={"bot": tg}
+        )
+        params = tg.session.prepare_value(msg.reply_video("file").reply_parameters, bot=tg, files={})
+        self.assertIn('"allow_sending_without_reply": true', params)
+
+
 if __name__ == "__main__":
     unittest.main()
