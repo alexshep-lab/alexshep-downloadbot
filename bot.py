@@ -780,7 +780,12 @@ def _ydl_opts(
     }
 
 
-def _pick_entry(info: dict) -> dict:
+def _pick_entry(info: dict | None) -> dict:
+    if not info:
+        # yt-dlp возвращает None, когда извлекатель ничего не нашёл. Так бывает с фото-сторис:
+        # в ленту сторис он кладёт только видео и нужную сторис среди них не находит.
+        # Текст — признак «нет видео», чтобы для Instagram сработал путь через API.
+        raise yt_dlp.utils.DownloadError("There is no video in this post")
     # у каруселей/плейлистов берём первый элемент
     while info.get("entries") is not None:
         entries = [e for e in info["entries"] if e]
@@ -1068,6 +1073,9 @@ def is_no_video_error(exc: yt_dlp.utils.DownloadError) -> bool:
 def _ig_media_pk(url: str) -> int | None:
     """id поста для API: shortcode из ссылки — это число в base64 (у приватных после 11 символов хвост)."""
     path = [p for p in urlparse(url).path.split("/") if p]
+    # сторис: /stories/автор/3993438272162923132 — в ссылке уже числовой id, не shortcode
+    if len(path) >= 3 and path[0] == "stories" and path[2].isdigit():
+        return int(path[2])
     for marker in ("p", "reel", "reels", "tv"):
         if marker in path and len(path) > path.index(marker) + 1:
             pk = 0
@@ -1323,6 +1331,9 @@ def _with_cookie_retry(fn, url: str, workdir: Path, on_progress) -> tuple[Path, 
             "private", "400: bad request",
             # возрастное или страновое ограничение: анонимно Instagram такой пост не покажет
             "available to everyone", "certain audiences",
+            # общий признак: yt-dlp сам советует cookies, когда без входа не пускают
+            # (сторис — «This content is unreachable. Use --cookies…»)
+            "use --cookies",
         ))
         if (has_cookie_fallback(service) and (is_auth_error(exc) or ig_needs_login)
                 and not (service == "ig" and is_rate_limited(exc))):

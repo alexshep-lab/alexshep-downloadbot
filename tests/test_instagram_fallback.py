@@ -231,3 +231,38 @@ class AudienceRestrictedTests(unittest.TestCase):
         )
         text = bot.friendly_dlp_error(exc, "ig")
         self.assertIn("возрастное", text)
+
+
+class StoryNeedsLoginTests(unittest.TestCase):
+    """Сторис без входа недоступны: yt-dlp пишет «unreachable. Use --cookies…»."""
+
+    setUp = InstagramFallbackTests.setUp
+    write_session = InstagramFallbackTests.write_session
+
+    def test_story_is_retried_with_account(self):
+        attempts = []
+
+        def grab(url, workdir, hook, with_cookies):
+            attempts.append(with_cookies)
+            if not with_cookies:
+                raise bot.yt_dlp.utils.DownloadError(
+                    "ERROR: [instagram:story] 1: This content is unreachable. "
+                    "Use --cookies-from-browser or --cookies for the authentication."
+                )
+            return self.root / "story.mp4", {}
+
+        story = "https://www.instagram.com/stories/someone/3993438272162923132"
+        path, info = bot._with_cookie_retry(grab, story, self.root, None)
+        self.assertEqual(attempts, [False, True])
+        self.assertIn("_ig_authenticated", info)
+
+
+class StoryMediaIdTests(unittest.TestCase):
+    def test_story_url_gives_numeric_media_id(self):
+        story = "https://www.instagram.com/stories/someone/3993438272162923132"
+        self.assertEqual(bot._ig_media_pk(story), 3993438272162923132)
+
+    def test_empty_extractor_result_means_no_video(self):
+        with self.assertRaises(bot.yt_dlp.utils.DownloadError) as caught:
+            bot._pick_entry(None)
+        self.assertTrue(bot.is_no_video_error(caught.exception))
