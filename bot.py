@@ -55,6 +55,11 @@ ALLOWED_USER_IDS = {
 ALLOWED_CHAT_IDS = {
     int(part) for part in os.getenv("ALLOWED_CHAT_IDS", "").replace(" ", "").split(",") if part
 }
+# Кому не показываем кнопку «Отменить»: кидают ссылки «просто поделиться» и тут же отменяют.
+# По id, а не по нику: ник можно сменить.
+NO_CANCEL_USER_IDS = {
+    int(part) for part in os.getenv("NO_CANCEL_USER_IDS", "").replace(" ", "").split(",") if part
+}
 COOKIES_FILE = os.getenv("COOKIES_FILE", "").strip()
 # Для каких сервисов подставлять cookies: ig/yt/tt/x через запятую либо all.
 # По умолчанию только Instagram: yt-dlp дописывает в файл cookies всех посещённых
@@ -170,11 +175,21 @@ def may_manage(user_id: int, requester_id: int) -> bool:
     return user_id == requester_id or user_id in ALLOWED_USER_IDS
 
 
-def progress_kb(job: Job) -> InlineKeyboardMarkup:
-    buttons = [InlineKeyboardButton(text="❌ Отменить", callback_data=f"c:{job.id}")]
+def may_cancel(user_id: int, requester_id: int) -> bool:
+    """Отменить может тот, кто прислал ссылку, и владелец — кроме тех, кому отмену запретили."""
+    if user_id in ALLOWED_USER_IDS:
+        return True
+    return user_id == requester_id and user_id not in NO_CANCEL_USER_IDS
+
+
+def progress_kb(job: Job) -> InlineKeyboardMarkup | None:
+    buttons = []
+    if job.requester_id not in NO_CANCEL_USER_IDS:
+        buttons.append(InlineKeyboardButton(text="❌ Отменить", callback_data=f"c:{job.id}"))
     if job.kind == "video":
         buttons.insert(0, InlineKeyboardButton(text="🎵 Только звук", callback_data=f"a:{job.id}"))
-    return InlineKeyboardMarkup(inline_keyboard=[buttons])
+    # пустую клавиатуру Telegram не принимает — тогда кнопок просто нет
+    return InlineKeyboardMarkup(inline_keyboard=[buttons]) if buttons else None
 
 
 def cache_key(key: str, kind: str) -> str:
@@ -2318,10 +2333,14 @@ async def cb_cancel(query: CallbackQuery) -> None:
     if not job:
         await query.answer("Эта закачка уже завершилась.", show_alert=True)
         return
-    if not may_manage(query.from_user.id, job.requester_id):
+    if query.from_user.id in NO_CANCEL_USER_IDS and query.from_user.id not in ALLOWED_USER_IDS:
+        await query.answer("Отменять закачки тебе нельзя.", show_alert=True)
+        return
+    if not may_cancel(query.from_user.id, job.requester_id):
         await query.answer("Отменить может только тот, кто прислал ссылку.", show_alert=True)
         return
     job.cancelled = True
+    log.info("закачку %s отменил %s (id=%s)", job.id, one_line(query.from_user.username or query.from_user.full_name), query.from_user.id)
     await query.answer("Отменяю…")
 
 
@@ -2337,6 +2356,7 @@ async def cb_audio(query: CallbackQuery) -> None:
         return
     job.cancelled = True
     job.kind = "audio"  # download_and_send перезапустит закачку в аудиорежиме
+    log.info("закачку %s переключил на звук %s (id=%s)", job.id, one_line(query.from_user.username or query.from_user.full_name), query.from_user.id)
     await query.answer("Переключаюсь на звук…")
 
 

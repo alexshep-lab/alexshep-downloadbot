@@ -113,5 +113,50 @@ class DeletedLinkMessageTests(unittest.TestCase):
         self.assertIn('"allow_sending_without_reply": true', params)
 
 
+class NoCancelTests(unittest.TestCase):
+    OWNER, BANNED, OTHER = 213925600, 84884747, 555
+
+    def setUp(self):
+        for name, value in {"ALLOWED_USER_IDS": {self.OWNER}, "NO_CANCEL_USER_IDS": {self.BANNED}}.items():
+            p = patch.object(bot, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def buttons(self, job):
+        kb = bot.progress_kb(job)
+        return [b.text for row in kb.inline_keyboard for b in row] if kb else []
+
+    def test_banned_user_gets_no_cancel_button(self):
+        video = bot.Job(self.BANNED, "video")
+        audio = bot.Job(self.BANNED, "audio")
+        normal = bot.Job(self.OTHER, "video")
+        try:
+            self.assertEqual(self.buttons(video), ["🎵 Только звук"])
+            self.assertIsNone(bot.progress_kb(audio))  # пустой клавиатуры не шлём
+            self.assertIn("❌ Отменить", self.buttons(normal))
+        finally:
+            for job in (video, audio, normal):
+                job.close()
+
+    def test_banned_user_cannot_cancel_but_owner_can(self):
+        self.assertFalse(bot.may_cancel(self.BANNED, self.BANNED))
+        self.assertTrue(bot.may_cancel(self.OWNER, self.BANNED))
+        self.assertTrue(bot.may_cancel(self.OTHER, self.OTHER))
+        self.assertFalse(bot.may_cancel(self.OTHER, self.BANNED))
+
+    def test_cancel_button_press_is_refused(self):
+        job = bot.Job(self.BANNED, "video")
+        query = SimpleNamespace(
+            data=f"c:{job.id}", from_user=SimpleNamespace(id=self.BANNED, username="x", full_name="x"),
+            answer=AsyncMock(),
+        )
+        try:
+            asyncio.run(bot.cb_cancel(query))
+            self.assertFalse(job.cancelled)
+            self.assertIn("нельзя", query.answer.call_args.args[0])
+        finally:
+            job.close()
+
+
 if __name__ == "__main__":
     unittest.main()
