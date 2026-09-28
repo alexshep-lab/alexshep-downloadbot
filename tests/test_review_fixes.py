@@ -158,5 +158,23 @@ class NoCancelTests(unittest.TestCase):
             job.close()
 
 
+class IgnoredUserTests(unittest.TestCase):
+    def test_links_from_ignored_user_get_no_reaction(self):
+        user = SimpleNamespace(id=84884747, full_name="x", username="x")
+        chat = SimpleNamespace(id=-100, type=bot.ChatType.SUPERGROUP, title="t")
+        msg = SimpleNamespace(from_user=user, chat=chat, sender_chat=None,
+                              text="https://youtu.be/abc", reply=AsyncMock(), answer=AsyncMock())
+        with (
+            patch.object(bot, "IGNORED_USER_IDS", {84884747}),
+            patch.object(bot, "ALLOWED_CHAT_IDS", {-100}),
+            patch.object(bot, "deliver", AsyncMock()) as deliver,
+        ):
+            asyncio.run(bot.handle_link(msg))
+            asyncio.run(bot.cmd_start(msg))
+        deliver.assert_not_awaited()
+        msg.reply.assert_not_awaited()
+        msg.answer.assert_not_awaited()
+
+
 if __name__ == "__main__":
     unittest.main()

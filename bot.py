@@ -55,6 +55,10 @@ ALLOWED_USER_IDS = {
 ALLOWED_CHAT_IDS = {
     int(part) for part in os.getenv("ALLOWED_CHAT_IDS", "").replace(" ", "").split(",") if part
 }
+# Чьи сообщения бот не замечает вовсе: ни ссылки, ни команды — ответа не будет.
+IGNORED_USER_IDS = {
+    int(part) for part in os.getenv("IGNORED_USER_IDS", "").replace(" ", "").split(",") if part
+}
 # Кому не показываем кнопку «Отменить»: кидают ссылки «просто поделиться» и тут же отменяют.
 # По id, а не по нику: ник можно сменить.
 NO_CANCEL_USER_IDS = {
@@ -1940,6 +1944,8 @@ async def cb_access(query: CallbackQuery) -> None:
 @router.message(CommandStart())
 @router.message(Command("help"))
 async def cmd_start(message: Message) -> None:
+    if is_ignored(message):
+        return
     if not is_allowed(message):
         if message.chat.type == ChatType.PRIVATE:
             await ask_stranger(message)
@@ -1958,8 +1964,15 @@ async def cmd_id(message: Message) -> None:
     )
 
 
+def is_ignored(message: Message) -> bool:
+    user = message.from_user
+    return bool(user and user.id in IGNORED_USER_IDS and user.id not in ALLOWED_USER_IDS)
+
+
 @router.message(F.text)
 async def handle_link(message: Message) -> None:
+    if is_ignored(message):
+        return
     is_private = message.chat.type == ChatType.PRIVATE
     allowed = is_allowed(message)
     if is_private and not allowed:
