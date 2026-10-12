@@ -6,6 +6,7 @@
 import asyncio
 import collections
 import contextlib
+import functools
 import hashlib
 import html
 import io
@@ -150,6 +151,10 @@ class UrlLock:
 url_locks: dict[str, UrlLock] = {}
 jobs: dict[str, "Job"] = {}  # идущие закачки, чтобы их можно было отменить кнопкой
 job_counter = itertools.count(1)
+# Идущие эфиры, по которым предложили записать кусок: id предложения → откуда и для кого.
+live_offers: dict[str, dict] = {}
+LIVE_OFFER_TTL_SEC = 3600  # кнопки старше часа уже не работают
+offer_counter = itertools.count(1)
 
 
 class CancelledByUser(Exception):
@@ -1054,6 +1059,9 @@ class ProgressReporter:
         if status == "photos":
             self._show("🖼 В посте только фото — забираю их…")
             return
+        if status == "recording":
+            self._show("⏺ Записываю эфир…")
+            return
         if status != "downloading":
             return
         if time.monotonic() - self._last_at < PROGRESS_INTERVAL:
@@ -1212,13 +1220,33 @@ IG_API_HEADERS = {
     ),
 }
 IG_SHORTCODE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
-NO_VIDEO_MARKERS = ("no video formats found", "there is no video in this post")
+NO_VIDEO_MARKERS = ("no video formats found", "there is no video in this post", "no video could be found in this tweet")
+X_NO_MEDIA = "No photos or video in this tweet"
+X_HIDDEN = "X shows this tweet only to logged-in users"
+X_MAX_PHOTOS = 20  # у X до 4 картинок в твите, это просто предохранитель
 IG_LOGGED_OUT_MARKER = "session is logged out"
 SLIDE_SEC = 3  # сколько показывать фото в карусели
 SLIDE_MAX_SEC = 6  # фото мало, а музыки много — растягиваем, но не до бесконечности
 SLIDESHOW_FPS = 25
 SLIDESHOW_MAX_SEC = 180
 SLIDESHOW_SIDE = 1080  # ширина кадра слайд-шоу
+
+
+class LiveStreamError(yt_dlp.utils.DownloadError):
+    """Ссылка на идущий прямой эфир: целиком его не скачать — yt-dlp писал бы его,
+    пока не кончится трансляция или таймаут, и всё это время держал бы слот."""
+
+    def __init__(self, info: dict) -> None:
+        super().__init__("live stream is in progress")
+        self.title = info.get("title") or ""
+
+
+def ensure_not_live(info: dict) -> None:
+    if info.get("live_status") == "is_live" or info.get("is_live"):
+        raise LiveStreamError(info)
+
+
+LIVE_CLIP_MINUTES = (1, 5, 10)  # какие куски эфира предлагаем записать
 
 
 def is_no_video_error(exc: yt_dlp.utils.DownloadError) -> bool:
@@ -1266,6 +1294,7 @@ def _ig_fetch(
     dest: Path,
     headers: dict | None = None,
     max_bytes: int = MAX_FILE_SIZE,
+    source: str = "Instagram",
 ) -> Path:
     """Качает файл через yt-dlp: так работают те же cookies и прокси, что и у видео."""
     try:
@@ -1287,9 +1316,9 @@ def _ig_fetch(
             # но Instagram её больше не принимает — пост ни при чём, 404 тут вводит в заблуждение
             raise yt_dlp.utils.DownloadError(f"Instagram: {IG_LOGGED_OUT_MARKER}") from exc
         # текст «HTTP Error 429: …» подхватят те же разборщики ошибок, что и у yt-dlp
-        raise yt_dlp.utils.DownloadError(f"Instagram: {exc}") from exc
+        raise yt_dlp.utils.DownloadError(f"{source}: {exc}") from exc
     except yt_dlp.networking.exceptions.RequestError as exc:
-        raise yt_dlp.utils.DownloadError(f"Instagram: {exc}") from exc
+        raise yt_dlp.utils.DownloadError(f"{source}: {exc}") from exc
     return dest
 
 
@@ -1520,7 +1549,64 @@ def _with_photo_fallback(fn, fallback, url: str, workdir: Path, on_progress) -> 
             raise
 
 
+def x_photos(url: str, workdir: Path, on_progress=None) -> tuple[Path, dict]:
+    """Твит из одних картинок → info["album"], как у фото-постов Instagram.
+
+    yt-dlp ищет в твите только видео; данные твита берём тем же его извлекателем
+    (гостевой токен, cookies, прокси — всё как у видео), а картинки качаем сами.
+    """
+    workdir.mkdir(parents=True, exist_ok=True)
+    match = re.search(r"/status(?:es)?/(\d+)", urlparse(url).path)
+    if not match:
+        raise yt_dlp.utils.DownloadError(X_NO_MEDIA)
+    with yt_dlp.YoutubeDL(_base_opts("x")) as ydl:
+        ie = ydl.get_info_extractor("Twitter")
+        ie.initialize()
+        tweet = ie._extract_status(match.group(1))
+        if not (tweet.get("full_text") or tweet.get("text") or (tweet.get("user") or {}).get("screen_name")):
+            # вместо твита заглушка (TweetTombstone): гостям X не показывает 18+,
+            # закрытые аккаунты и удалённое — yt-dlp об этом молчит и пишет «нет видео»
+            raise yt_dlp.utils.DownloadError(X_HIDDEN)
+        # картинки самого твита, а если их нет — цитируемого: так их показывает и X
+        photos = []
+        for source in (tweet, tweet.get("quoted_status") or {}):
+            media = (source.get("extended_entities") or {}).get("media") or []
+            photos = [m.get("media_url_https") or m.get("media_url") for m in media if m.get("type") == "photo"]
+            photos = [p for p in photos if p]
+            if photos:
+                break
+        if not photos:
+            raise yt_dlp.utils.DownloadError(X_NO_MEDIA)
+        files = []
+        for n, photo in enumerate(photos[:X_MAX_PHOTOS]):
+            if on_progress:
+                on_progress({"status": "photos"})
+            # name=large — до 2048 px: крупнее Telegram всё равно пережмёт
+            big = yt_dlp.utils.update_url_query(photo, {"name": "large"})
+            files.append(("photo", _ig_fetch(ydl, big, workdir / f"p{n:02d}", source="X")))
+    user = tweet.get("user") or {}
+    text = re.sub(r"\s*https?://t\.co/\S+", "", tweet.get("full_text") or tweet.get("text") or "").strip()
+    author = f"@{user['screen_name']}" if user.get("screen_name") else (user.get("name") or "X")
+    return workdir, {
+        "title": f"{author}: {text}" if text else f"Фото {author}",
+        "album": _telegram_photos(files, on_progress),
+    }
+
+
+def _with_x_photos(url: str, workdir: Path, on_progress) -> tuple[Path, dict]:
+    """В твите нет видео — возможно, там картинки."""
+    try:
+        return _with_cookie_retry(_download_video, url, workdir, on_progress)
+    except yt_dlp.utils.DownloadError as exc:
+        if not is_no_video_error(exc):
+            raise
+        log.info("[%s] видео в твите нет — забираю картинки", url_key(url))
+        return x_photos(url, workdir, on_progress)
+
+
 def download_video(url: str, workdir: Path, on_progress=None) -> tuple[Path, dict]:
+    if service_of(url_key(url)) == "x":
+        return _with_x_photos(url, workdir, on_progress)
     return _with_photo_fallback(_download_video, build_ig_slideshow, url, workdir, on_progress)
 
 
@@ -1532,6 +1618,9 @@ def _download_audio(url: str, workdir: Path, on_progress, with_cookies: bool) ->
     """Забирает только звуковую дорожку и кладёт её в mp3 с тегами и обложкой."""
     workdir.mkdir(parents=True, exist_ok=True)
     service = service_of(url_key(url))
+    # сначала только смотрим: эфир звуком «скачивался» бы, пока не кончится трансляция
+    with yt_dlp.YoutubeDL(_base_opts(service, with_cookies)) as ydl:
+        ensure_not_live(_pick_entry(ydl.extract_info(url, download=False)))
     with yt_dlp.YoutubeDL(_audio_opts(workdir, on_progress, service, with_cookies)) as ydl:
         info = _pick_entry(ydl.extract_info(url, download=True))
     audio = next((f for f in workdir.glob("*.mp3")), None)
@@ -1549,6 +1638,7 @@ def _download_video(url: str, workdir: Path, on_progress, with_cookies: bool) ->
     service = service_of(url_key(url))
     with yt_dlp.YoutubeDL(_base_opts(service, with_cookies)) as ydl:
         probe = _pick_entry(ydl.extract_info(url, download=False))
+    ensure_not_live(probe)
     start_height = choose_start_height(probe)
     side = short_side(probe)
     ladder = tuple(h for h in HEIGHT_LADDER if h <= start_height) or (HEIGHT_LADDER[-1],)
@@ -1574,6 +1664,37 @@ def _download_video(url: str, workdir: Path, on_progress, with_cookies: bool) ->
             return path, info
         path.unlink(missing_ok=True)
     raise TooLargeError
+
+
+def record_live(url: str, workdir: Path, on_progress, seconds: int) -> tuple[Path, dict]:
+    """Записывает кусок прямого эфира с текущего момента.
+
+    yt-dlp только находит адреса потоков (у эфира YouTube видео и звук — отдельные HLS),
+    а пишет их наш ffmpeg: его мы опрашиваем раз в секунду, поэтому «Отменить» срабатывает
+    сразу. Внутренний загрузчик yt-dlp во время записи хуки не вызывает вовсе.
+    """
+    workdir.mkdir(parents=True, exist_ok=True)
+    service = service_of(url_key(url))
+    with yt_dlp.YoutubeDL(_ydl_opts(workdir, MAX_HEIGHT, None, service)) as ydl:
+        info = _pick_entry(ydl.extract_info(url, download=False))
+    streams = info.get("requested_formats") or [info]
+    inputs = []
+    for stream in streams:
+        if not stream.get("url"):
+            raise yt_dlp.utils.DownloadError("не нашёл адрес потока эфира")
+        headers = "".join(f"{k}: {v}\r\n" for k, v in (stream.get("http_headers") or {}).items())
+        # rw_timeout: если эфир подвиснет, ffmpeg не будет ждать вечно (микросекунды)
+        inputs += [*(["-headers", headers] if headers else []), "-rw_timeout", "15000000", "-i", stream["url"]]
+    out = workdir / "live.mp4"
+    _run_ffmpeg(
+        [*inputs, "-t", str(seconds), "-map", "0:v:0", "-map", f"{len(streams) - 1}:a:0?",
+         "-c", "copy", "-movflags", "+faststart", str(out)],
+        on_progress, "recording",
+    )
+    path = make_ios_compatible(out, info, on_progress)  # размеры и длительность — из самого файла
+    if path.stat().st_size > MAX_FILE_SIZE:
+        raise TooLargeError
+    return path, info
 
 
 TRANSIENT_ERROR_MARKERS = (
@@ -1616,7 +1737,17 @@ def friendly_dlp_error(exc: yt_dlp.utils.DownloadError, service: str = "") -> st
             f"Подожду {RATE_LIMIT_COOLDOWN_MIN} минут и снова буду принимать ссылки — "
             f"повторять сейчас бесполезно, от этого блокировка только продлевается."
         )
+    if X_NO_MEDIA.lower() in low:
+        return "🤷 В этом твите нет ни видео, ни картинок — скачивать нечего."
+    if X_HIDDEN.lower() in low:
+        return (
+            "🔞 X показывает этот твит только залогиненным: так он прячет контент 18+, "
+            "закрытые аккаунты и удалённые твиты. Аккаунта X у бота нет — скачать не получится."
+        )
     if is_no_video_error(exc):
+        if service == "x":
+            # сюда попадает только «Только звук»: картинки из твита бот присылает по самой ссылке
+            return "🖼 В этом твите нет видео — звук взять неоткуда."
         if service == "ig" and not ig_cookies_configured():
             # без аккаунта музыку поста не проверить, так что «музыки нет» было бы враньём
             return (
@@ -2178,20 +2309,47 @@ async def run_download(job: Job, status: Message, grab, *args):
         raise DownloadTimedOut from None
 
 
+def live_kb(offer_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=f"⏺ {minutes} мин", callback_data=f"rec:{offer_id}:{minutes}")
+        for minutes in LIVE_CLIP_MINUTES
+    ]])
+
+
+def offer_live_clip(message: Message, url: str, key: str, who: str) -> str:
+    """Запоминает эфир, чтобы кнопка «⏺ N мин» знала, что и кому записывать."""
+    now = time.monotonic()
+    for stale in [o for o, v in live_offers.items() if now - v["at"] > LIVE_OFFER_TTL_SEC]:
+        del live_offers[stale]
+    offer_id = str(next(offer_counter))
+    live_offers[offer_id] = {
+        "message": message, "url": url, "key": key, "who": who,
+        "requester": requester_id_of(message), "at": now,
+    }
+    return offer_id
+
+
 async def download_and_send(
-    message: Message, status: Message, url: str, key: str, who: str, kind: str
+    message: Message, status: Message, url: str, key: str, who: str, kind: str,
+    live_seconds: int = 0,
 ) -> None:
+    """kind: video | audio | live (кусок эфира длиной live_seconds)."""
     requester_id = requester_id_of(message)
     job = Job(requester_id, kind)
     reporter = ProgressReporter(asyncio.get_running_loop(), status, job)
-    grab = download_audio if kind == "audio" else download_video
+    if kind == "live":
+        grab = functools.partial(record_live, seconds=live_seconds)
+    else:
+        grab = download_audio if kind == "audio" else download_video
     workdir = DOWNLOAD_DIR / uuid.uuid4().hex
     started = time.monotonic()
     try:
-        await status.edit_text(
-            "🔍 Смотрю, что за видео…" if kind == "video" else "🎵 Достаю звуковую дорожку…",
-            reply_markup=progress_kb(job),
-        )
+        first_status = {
+            "video": "🔍 Смотрю, что за видео…",
+            "audio": "🎵 Достаю звуковую дорожку…",
+            "live": f"⏺ Записываю {live_seconds // 60} мин эфира…",
+        }[kind]
+        await status.edit_text(first_status, reply_markup=progress_kb(job))
         # Instagram встаёт в свою очередь до того, как занять слот: запросы с аккаунтом идут
         # по одному, и без этого две такие закачки заняли бы оба слота, а YouTube ждал бы их.
         ig_turn = ig_queue if service_of(key) == "ig" else contextlib.nullcontext()
@@ -2217,6 +2375,8 @@ async def download_and_send(
                 await asyncio.sleep(delay)
         job.check()
         title = (info.get("title") or ("Аудио" if kind == "audio" else "Видео"))[:900]
+        if kind == "live":
+            title = f"{title[:850]} — {live_seconds // 60} мин эфира"
         if info.get("album"):  # пост из одних фото, без музыки
             album = info["album"]
             await status.edit_text(f"📤 Отправляю в Telegram… ({len(album)} шт.)")
@@ -2261,14 +2421,14 @@ async def download_and_send(
             )
         sent = await message.bot(send, request_timeout=UPLOAD_TIMEOUT)
         media = sent.audio if kind == "audio" else sent.video
-        if media:  # запомним, чтобы второй раз не качать
+        if media and kind != "live":  # запомним, чтобы второй раз не качать; кусок эфира — не кешируем
             cache_put(key, kind, media.file_id, title)
         if service_of(key) == "ig":
             await report_ig_result(message.bot, info)
         log.info(
             "[%s/%s] готово за %s: %s, %s, для %s",
             key, kind, fmt_time(time.monotonic() - started), fmt_size(size),
-            f"{info.get('height')}p" if kind == "video" else "mp3", who,
+            "mp3" if kind == "audio" else f"{info.get('height')}p", who,
         )
         await status.delete()
     except CancelledByUser:
@@ -2291,6 +2451,14 @@ async def download_and_send(
             else f"😞 Видео не влезает в {MAX_FILE_SIZE_MB} МБ даже в {HEIGHT_LADDER[-1]}p."
         )
         await show_error(status, f"{limit_note}\n{hint}")
+    except LiveStreamError:
+        offer_id = offer_live_clip(message, url, key, who)
+        log.info("[%s] идёт эфир — предложил записать кусок для %s", key, who)
+        await status.edit_text(
+            "🔴 Это прямой эфир — целиком его не скачать, пока трансляция идёт.\n"
+            "Могу записать кусок с этого момента:",
+            reply_markup=live_kb(offer_id),
+        )
     except DownloadTimedOut:
         log.warning("[%s/%s] не уложилось в %d с", key, kind, DOWNLOAD_TIMEOUT)
         await report_failure(message, key, url, kind, "таймаут", f"дольше {DOWNLOAD_TIMEOUT} с")
@@ -2355,6 +2523,44 @@ async def cb_cancel(query: CallbackQuery) -> None:
     job.cancelled = True
     log.info("закачку %s отменил %s (id=%s)", job.id, one_line(query.from_user.username or query.from_user.full_name), query.from_user.id)
     await query.answer("Отменяю…")
+
+
+@router.callback_query(F.data.startswith("rec:"))
+async def cb_record(query: CallbackQuery) -> None:
+    """«⏺ N мин»: записать кусок идущего эфира с текущего момента."""
+    try:
+        _, offer_id, raw_minutes = query.data.split(":")
+        minutes = int(raw_minutes)
+    except ValueError:
+        await query.answer("Непонятная кнопка.", show_alert=True)
+        return
+    offer = live_offers.get(offer_id)
+    if not offer or minutes not in LIVE_CLIP_MINUTES or not query.message:
+        await query.answer("Предложение устарело — пришли ссылку на эфир заново.", show_alert=True)
+        return
+    user_id = query.from_user.id
+    if user_id in IGNORED_USER_IDS and user_id not in ALLOWED_USER_IDS:
+        await query.answer("Эта кнопка не для тебя.", show_alert=True)
+        return
+    if not may_manage(user_id, offer["requester"]):
+        await query.answer("Записать может только тот, кто прислал ссылку.", show_alert=True)
+        return
+    if await reserve_request(offer["requester"]):
+        await query.answer("⏳ Сейчас очередь заполнена. Попробуй чуть позже.", show_alert=True)
+        return
+    live_offers.pop(offer_id, None)  # одно нажатие — одна запись
+    log.info(
+        "[%s] запись %d мин эфира заказал %s (id=%s)",
+        offer["key"], minutes, one_line(query.from_user.username or query.from_user.full_name), user_id,
+    )
+    await query.answer(f"Записываю {minutes} мин…")
+    try:
+        await download_and_send(
+            offer["message"], query.message, offer["url"], offer["key"], offer["who"], "live",
+            live_seconds=minutes * 60,
+        )
+    finally:
+        await release_request(offer["requester"])
 
 
 @router.callback_query(F.data.startswith("a:"))
