@@ -64,13 +64,13 @@ class XPhotoTests(unittest.TestCase):
 
     def test_photos_come_as_album_with_tweet_text(self):
         _, info = self.grab(tweet(photos=["https://pbs.twimg.com/media/A.jpg", "https://pbs.twimg.com/media/B.jpg"]))
-        self.assertEqual([kind for kind, _ in info["album"]], ["photo", "photo"])
-        self.assertIn("name=large", info["album"][0][1].read_text())
+        self.assertEqual([kind for kind, _ in info["photo_album"]], ["photo", "photo"])
+        self.assertIn("name=large", info["photo_album"][0][1].read_text())
         self.assertEqual(info["title"], "@someone: Смотри")  # ссылка t.co из текста убрана
 
     def test_quoted_tweet_photos_are_used_when_tweet_has_none(self):
         _, info = self.grab(tweet(quoted_photos=["https://pbs.twimg.com/media/Q.jpg"]))
-        self.assertEqual(len(info["album"]), 1)
+        self.assertEqual(len(info["photo_album"]), 1)
 
     def test_hidden_tweet_is_not_called_empty(self):
         # так graphql-заглушку TweetTombstone превращает yt-dlp
@@ -94,7 +94,7 @@ class XRoutingTests(unittest.TestCase):
         def no_video(*args):
             raise yt_dlp.utils.DownloadError("ERROR: [twitter] 1: No video could be found in this tweet")
 
-        album = (Path("."), {"album": [("photo", Path("a.jpg"))], "title": "t"})
+        album = (Path("."), {"photo_album": [("photo", Path("a.jpg"))], "title": "t"})
         with patch.object(bot, "_download_video", no_video), patch.object(bot, "x_photos", return_value=album) as photos:
             self.assertIs(bot.download_video(URL, Path("w")), album)
         photos.assert_called_once()

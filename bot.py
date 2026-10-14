@@ -1406,7 +1406,7 @@ def _ig_music_only(url: str, workdir: Path, on_progress=None) -> tuple[Path, dic
 
 def build_ig_slideshow(url: str, workdir: Path, on_progress=None) -> tuple[Path, dict]:
     """Пост из фото (одно фото или карусель): с музыкой → видео, как его показывает Instagram,
-    без музыки → сами фото, info["album"] = [(вид, путь), …].
+    без музыки → сами фото, info["photo_album"] = [(вид, путь), …].
 
     yt-dlp такие посты не качает: видео в них нет. Берём слайды и трек из API,
     каждый слайд кодируем в одинаковый отрезок, склеиваем и накладываем музыку.
@@ -1427,7 +1427,7 @@ def build_ig_slideshow(url: str, workdir: Path, on_progress=None) -> tuple[Path,
         if not files:
             raise yt_dlp.utils.DownloadError("There is no video in this post")
         if not music:
-            return workdir, {"title": _ig_title(item, None), "album": _telegram_photos(files, on_progress)}
+            return workdir, {"title": _ig_title(item, None), "photo_album": _telegram_photos(files, on_progress)}
         track = _ig_fetch(ydl, music["url"], workdir / "music")
 
     # кадр по пропорциям первого слайда: в карусели Instagram они у всех одинаковые
@@ -1550,7 +1550,7 @@ def _with_photo_fallback(fn, fallback, url: str, workdir: Path, on_progress) -> 
 
 
 def x_photos(url: str, workdir: Path, on_progress=None) -> tuple[Path, dict]:
-    """Твит из одних картинок → info["album"], как у фото-постов Instagram.
+    """Твит из одних картинок → info["photo_album"], как у фото-постов Instagram.
 
     yt-dlp ищет в твите только видео; данные твита берём тем же его извлекателем
     (гостевой токен, cookies, прокси — всё как у видео), а картинки качаем сами.
@@ -1589,7 +1589,7 @@ def x_photos(url: str, workdir: Path, on_progress=None) -> tuple[Path, dict]:
     author = f"@{user['screen_name']}" if user.get("screen_name") else (user.get("name") or "X")
     return workdir, {
         "title": f"{author}: {text}" if text else f"Фото {author}",
-        "album": _telegram_photos(files, on_progress),
+        "photo_album": _telegram_photos(files, on_progress),
     }
 
 
@@ -2377,8 +2377,8 @@ async def download_and_send(
         title = (info.get("title") or ("Аудио" if kind == "audio" else "Видео"))[:900]
         if kind == "live":
             title = f"{title[:850]} — {live_seconds // 60} мин эфира"
-        if info.get("album"):  # пост из одних фото, без музыки
-            album = info["album"]
+        if info.get("photo_album"):  # пост из одних фото; у yt-dlp "album" — название альбома трека
+            album = info["photo_album"]
             await status.edit_text(f"📤 Отправляю в Telegram… ({len(album)} шт.)")
             await message.bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_PHOTO)
             sent_ids = await send_album(

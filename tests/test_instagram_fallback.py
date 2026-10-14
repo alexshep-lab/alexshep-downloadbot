@@ -112,7 +112,7 @@ class InstagramFallbackTests(unittest.TestCase):
 
     def test_photo_fallback_marks_authenticated_success(self):
         grab = Mock(side_effect=bot.yt_dlp.utils.DownloadError("There is no video in this post"))
-        photos = Mock(return_value=(self.root, {"album": []}))
+        photos = Mock(return_value=(self.root, {"photo_album": []}))
         _, info = bot._with_photo_fallback(grab, photos, URL, self.root, None)
         photos.assert_called_once()
         self.assertEqual(info["_ig_authenticated"], bot.ig_cookie_fingerprint())
